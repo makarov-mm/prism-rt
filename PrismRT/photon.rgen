@@ -1,0 +1,114 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#include "spectral.glsl"
+#include "common.glsl"
+
+// photon.rgen — forward photon transport pass, dispatched as a tiny ray-trace
+// (PH_APERTURE x PH_LAMBDA threads) BEFORE the camera pass every frame.
+//
+// The beam is traced FORWARD from the aperture, exactly the way the light
+// goes: backward connections from fog points through the prism are physically
+// impossible here — the reversed path enters the exit face near-normal, hits
+// the entry face beyond the critical angle and TIRs (the true arriving
+// direction differs from the beam axis by the full ~50 deg deviation).
+//
+// Air segments deposit XYZ energy into the 3D fog grid; photons landing on
+// the floor deposit into the 2D caustic map. Both are fixed-point atomics,
+// accumulated across frames (jittered by golden-ratio sequences) and
+// normalized by frame count at sampling time.
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT tlas;
+layout(location = 0) rayPayloadEXT Payload pay;
+
+const int PH_APERTURE = 60;
+const int PH_LAMBDA   = 12;
+
+void traceThin(vec3 o, vec3 d) {
+    pay.hitT = 1e30; pay.inst = 0xFFFFFFFFu;
+    traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, o, 1e-4, d, 1e4, 0);
+}
+
+void gridDeposit(vec3 a, vec3 b, vec3 xyzPower) {
+    vec3 dv = b - a;
+    float len = length(dv);
+    if (len < 1e-6) return;
+    vec3 d = dv / len;
+    int steps = int(len / (GRID_H * 0.5)) + 1;
+    float dl = len / float(steps);
+    float w = dl / (GRID_H * GRID_H * GRID_H);
+    for (int s = 0; s < steps; ++s) {
+        vec3 p = a + d * ((float(s) + 0.5) * dl);
+        ivec3 c = ivec3(floor((p - GRID_MIN) / GRID_H));
+        if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(GX, GY, GZ))))
+            continue;
+        uint o = (uint(c.z) * uint(GY) + uint(c.y)) * uint(GX) + uint(c.x);
+        vec3 v = xyzPower * w * FP_SCALE;
+        atomicAdd(fogGrid[o * 3u + 0u], uint(v.x));
+        atomicAdd(fogGrid[o * 3u + 1u], uint(v.y));
+        atomicAdd(fogGrid[o * 3u + 2u], uint(v.z));
+    }
+}
+
+void causticDeposit(vec3 p, vec3 xyzPower) {
+    float u = (p.x - CAUS_MIN) / (CAUS_MAX - CAUS_MIN);
+    float v = (p.z - CAUS_MIN) / (CAUS_MAX - CAUS_MIN);
+    int ix = int(u * float(CX)), iz = int(v * float(CZ));
+    if (ix < 0 || iz < 0 || ix >= CX || iz >= CZ) return;
+    float cell = (CAUS_MAX - CAUS_MIN) / float(CX);
+    float w = 1.0 / (cell * cell);
+    uint o = (uint(iz) * uint(CX) + uint(ix)) * 3u;
+    vec3 val = xyzPower * w * FP_SCALE;
+    atomicAdd(causMap[o + 0u], uint(val.x));
+    atomicAdd(causMap[o + 1u], uint(val.y));
+    atomicAdd(causMap[o + 2u], uint(val.z));
+}
+
+void main() {
+    uint ai = gl_LaunchIDEXT.x;              // aperture ray index
+    uint li = gl_LaunchIDEXT.y;              // spectral bundle index
+
+    float rot  = fract(float(U_FRAME) * 0.6180339887);
+    float rotA = fract(float(U_FRAME) * 0.7548776662);
+    float dL = (LAMBDA_MAX - LAMBDA_MIN) / float(PH_LAMBDA);
+    float lambda = LAMBDA_MIN + (float(li) + rot) * dL;
+    vec3  cw = cieXYZ(lambda) * dL;
+    float nG = glassN(lambda);
+
+    // low-discrepancy disk point (golden spiral), rotated per frame
+    float R = ubo.srcPosRadius.w;
+    float r = R * 0.92 * sqrt((float(ai) + 0.5) / float(PH_APERTURE));
+    float phi = 6.2831853 * fract((float(ai) + 0.5) * 0.6180339887 + rotA);
+    vec3 L = normalize(ubo.lightDir.xyz);
+    vec3 e1 = normalize(cross(L, vec3(0, 0, 1)));
+    vec3 o = ubo.srcPosRadius.xyz + e1 * (r * cos(phi)) + vec3(0, 0, 1) * (r * sin(phi));
+    vec3 d = -L;                             // light travels away from the source
+
+    float area = 3.14159265 * R * R;         // each ray carries I*A/N: the
+    vec3 power = cw * (U_INTENSITY * area / float(PH_APERTURE)); // column
+                                             // density reconstructs to I
+    bool inGlass = false;
+    for (int b = 0; b < 10; ++b) {
+        traceThin(o, d);
+        bool hit = (pay.inst != 0xFFFFFFFFu);
+        vec3 endP = o + d * (hit ? pay.hitT : 8.0);
+        if (!inGlass) gridDeposit(o, endP, power);
+        if (!hit) break;
+        if (pay.inst == 2u) { o = endP + d * 1e-4; continue; }   // own quad
+        if (pay.inst == 1u) {                                     // floor
+            if (!inGlass) causticDeposit(endP, power);
+            break;
+        }
+        vec3 nd; float omf;                                       // prism
+        bool entering = dot(d, pay.N) < 0.0;
+        if (refractAt(d, pay.N, nG, nd, omf)) {
+            power *= omf;
+            d = nd;
+            inGlass = entering;                                   // crossed
+        } else {
+            vec3 N = (dot(d, pay.N) > 0.0) ? -pay.N : pay.N;
+            d = normalize(reflect(d, N));                         // TIR: stay
+        }
+        o = endP + d * 1e-4;
+    }
+}

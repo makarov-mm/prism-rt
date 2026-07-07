@@ -1,0 +1,35 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "spectral.glsl"
+
+// resolve.comp — average the accumulated XYZ, normalize white, apply exposure,
+// convert XYZ -> sRGB, ACES tonemap, gamma. ACES rolls off bright saturated
+// colors smoothly — Reinhard-on-luma let the caustic hit the gamut ceiling
+// and posterize into per-channel clipping bands.
+// Run over the whole framebuffer after each accumulated RT frame.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba32f) uniform readonly  image2D accumImage;
+layout(binding = 1, rgba8)   uniform writeonly image2D outImage;
+
+layout(push_constant) uniform PC {
+    uint  frameCount;   // number of accumulated frames (>=1)
+    float exposure;
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(accumImage);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+
+    vec3 XYZ = imageLoad(accumImage, px).xyz / float(max(pc.frameCount, 1u));
+    XYZ /= CIE_Y_INTEGRAL;          // keep flat spectra neutral
+    XYZ *= pc.exposure;
+
+    vec3 rgb = max(xyzToSRGB(XYZ), vec3(0.0));
+    rgb = (rgb * (2.51 * rgb + 0.03)) / (rgb * (2.43 * rgb + 0.59) + 0.14);  // ACES
+    rgb = pow(clamp(rgb, 0.0, 1.0), vec3(1.0 / 2.2));
+
+    imageStore(outImage, px, vec4(rgb, 1.0));
+}
