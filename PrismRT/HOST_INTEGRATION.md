@@ -4,15 +4,22 @@
 > host (`PrismRT.cpp`). This file stays as the authoritative description of
 > the shader-side contract the host implements.
 
+Every number both sides must agree on — binding slots, TLAS instance ids,
+the photon launch size, fog-grid and caustic-map dimensions, the floor
+height — is defined once in `layout.h`, which `PrismRT.cpp` and
+`common.glsl` both include. Change it there and both sides follow.
+
 ## Descriptor set 0
 
-| binding | type            | stages            | content                          |
-|--------:|-----------------|-------------------|----------------------------------|
-| 0 | acceleration structure | rgen        | TLAS (one prism instance)        |
-| 1 | storage image rgba32f  | rgen        | XYZ accumulation                 |
-| 2 | storage buffer (scalar)| rchit       | positions, tight `vec3[6]`       |
-| 3 | storage buffer (scalar)| rchit       | indices, `uint[24]`              |
-| 4 | uniform buffer std140  | rgen/rchit/rmiss | `SceneUBO` (below)          |
+| binding | `layout.h` | type            | stages            | content                          |
+|--------:|------------|-----------------|-------------------|----------------------------------|
+| 0 | `BIND_TLAS`      | acceleration structure | rgen        | TLAS (prism, floor, source quad) |
+| 1 | `BIND_ACCUM`     | storage image rgba32f  | rgen        | XYZ accumulation                 |
+| 2 | `BIND_POSITIONS` | storage buffer (scalar)| rchit       | prism positions, tight `vec3[6]` |
+| 3 | `BIND_INDICES`   | storage buffer (scalar)| rchit       | prism indices, `uint[24]`        |
+| 4 | `BIND_SCENE`     | uniform buffer std140  | rgen/rchit/rmiss | `SceneUBO` (below)          |
+| 5 | `BIND_FOG_GRID`  | storage buffer         | rgen        | photon fog grid, fixed-point `uint[GX*GY*GZ*3]` |
+| 6 | `BIND_CAUSTIC`   | storage buffer         | rgen        | floor caustic map, fixed-point `uint[CX*CZ*3]`  |
 
 ## SceneUBO (std140, 144 bytes — mirrors `SceneUBO` in PrismRT.cpp)
 
@@ -63,8 +70,8 @@ whenever any geometry (the floor) lies beyond the source plane — the miss
 shader never runs. Camera rays hitting the quad outside the disk pass
 through; connections crossing the plane outside the disk terminate dark.
 
-TLAS instances: 0 = prism (rotates), 1 = floor (static), 2 = source quad
-(static).
+TLAS instances (`INST_*` in `layout.h`): 0 = prism (rotates), 1 = floor
+(static, dropped to `FLOOR_PLANE_Y`), 2 = source quad (static).
 
 ## Fog (single scattering)
 
@@ -84,8 +91,10 @@ throughput stays 1 (importance sampled).
 
 ## Per-frame loop (as implemented by the host)
 
-1. wait fence → update instance transform + UBO (reset `frameIndex` on any change)
-2. rebuild TLAS (one instance) + AS barrier
-3. `vkCmdTraceRaysKHR` (spp = 1 per frame, progressive)
-4. barrier → resolve compute (8×8 groups) → barrier
-5. blit `outImage` → swapchain image → present
+1. wait fence → update instance transforms + UBO (reset `frameIndex` on any change)
+2. rebuild TLAS (three instances) + AS barrier
+3. on reset: `vkCmdFillBuffer` the fog grid and caustic map to zero
+4. photon pass: `vkCmdTraceRaysKHR` (`PHOTON_APERTURE` × `PHOTON_LAMBDA`) → barrier
+5. camera pass: `vkCmdTraceRaysKHR` (spp = 1 per frame, progressive) → barrier
+6. resolve compute (8×8 groups) → barrier
+7. blit `outImage` → swapchain image → present

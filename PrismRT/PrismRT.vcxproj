@@ -27,8 +27,8 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ItemDefinitionGroup>
     <ClCompile>
-      <WarningLevel>Level3</WarningLevel>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <!-- Vulkan SDK provides only the headers; vulkan-1.dll is loaded at runtime -->
@@ -48,6 +48,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="PrismRT.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="layout.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="spectral.glsl" />

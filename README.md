@@ -152,7 +152,8 @@ the beam bounces internally between face pairs before escaping.
 
 | File | Role |
 |------|------|
-| `PrismRT.cpp` | the host, single file, zero dependencies: `vulkan-1.dll` loaded at runtime, nothing links against the SDK. Win32 window, device pick, swapchain, three BLAS (prism, floor, source quad), TLAS rebuilt per frame, two RT pipelines with their own SBTs, resolve compute, blit. Single frame in flight. |
+| `PrismRT.cpp` | the host, single C++23 file, zero dependencies: `vulkan-1.dll` loaded at runtime, nothing links against the SDK. Win32 window (per-monitor DPI aware), device pick, swapchain, three BLAS (prism, floor, source quad), TLAS rebuilt per frame, two RT pipelines with their own SBTs, resolve compute, blit. Single frame in flight. |
+| `layout.h` | the numbers host and shaders must agree on, in one place: descriptor bindings, TLAS instance ids, photon launch size, fog-grid and caustic-map dimensions, floor height. Included by `PrismRT.cpp` and `common.glsl`. |
 | `spectral.glsl` | GLSL mirror of `Spectral.h`, identical coefficients |
 | `common.glsl` | thin payload, scene UBO, photon-grid layout, shared scene constants |
 | `photon.rgen` | forward photon pass |
@@ -162,7 +163,12 @@ the beam bounces internally between face pairs before escaping.
 | `compile_shaders.bat` | GLSL to SPIR-V via `glslc` (Vulkan SDK) |
 
 Requirements: a GPU with `VK_KHR_ray_tracing_pipeline` (NVIDIA RTX, AMD
-RX 6000+, Intel Arc) and the Vulkan SDK at build time for `glslc`.
+RX 6000+, Intel Arc) and the Vulkan SDK at build time for `glslc` and the
+headers. Open `PrismRT.vcxproj` in Visual Studio 2022 (toolset v143,
+`/std:c++latest`), pick **Release / x64**, build; a pre-build step runs
+`compile_shaders.bat`. On a HiDPI display the window opens at the same
+apparent size and renders every physical pixel; the title bar shows the
+frame time.
 
 Controls: **LMB** orbit camera, **wheel** zoom, **RMB** rotate prism (dx:
 twist, dy: incidence angle), **G** SF10/BK7, **F** fog density, **+/-**
@@ -198,8 +204,9 @@ live single-batch image, on release it converges in well under a second.
 ## Verification
 
 The shaders pass `glslangValidator --target-env vulkan1.2`. The host
-cross-compiles cleanly under GCC with `-Wall -Wextra` (C++17). The camera
-and transform math is unit-tested. The full shader logic exists as a CPU
+cross-compiles cleanly for Windows under Clang with
+`-std=c++23 -Wall -Wextra -Wshadow`. The camera and transform math is
+unit-tested. The full shader logic exists as a CPU
 emulation that renders the identical algorithm to an image, which is how the
 broken backward connections were found and the forward transport was proven
 before a single line of GLSL was written.

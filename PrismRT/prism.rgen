@@ -15,8 +15,8 @@
 // The fog march READS the photon grid filled by photon.rgen — zero rays per
 // step. The rainbow fan and the floor caustic come from forward transport.
 
-layout(binding = 0, set = 0) uniform accelerationStructureEXT tlas;
-layout(binding = 1, set = 0, rgba32f) uniform image2D accumImage;
+layout(binding = BIND_TLAS,  set = 0) uniform accelerationStructureEXT tlas;
+layout(binding = BIND_ACCUM, set = 0, rgba32f) uniform image2D accumImage;
 
 layout(location = 0) rayPayloadEXT Payload pay;
 
@@ -138,9 +138,9 @@ float sunVisibility(vec3 P) {
     for (int b = 0; b < 4; ++b) {
         traceThin(o, SUN_DIR);
         if (pay.inst == 0xFFFFFFFFu) return w;               // reached the sky
-        if (pay.inst == 1u) return 0.0;                      // floor blocks
+        if (pay.inst == uint(INST_FLOOR)) return 0.0;        // floor blocks
         vec3 P2 = o + SUN_DIR * (pay.hitT + 1e-4);
-        if (pay.inst == 0u) w *= 0.90;                       // glass: pass, dim
+        if (pay.inst == uint(INST_PRISM)) w *= 0.90;         // glass: pass, dim
         o = P2;
     }
     return w;
@@ -157,13 +157,13 @@ float glassChain(vec3 hitP, vec3 I, vec3 Ng, float lambda) {
         traceThin(o, d);
         if (pay.inst == 0xFFFFFFFFu) return w * skySpectral(d, lambda);
         vec3 P = o + d * pay.hitT;
-        if (pay.inst == 2u) {                                // source quad
+        if (pay.inst == uint(INST_SOURCE)) {                 // source quad
             float e = diskEmit(P, d);
             if (e > 0.0) return w * e * U_INTENSITY;
             o = P + d * 1e-4;                                // transparent border
             continue;
         }
-        if (pay.inst == 1u) {                                // floor terminal
+        if (pay.inst == uint(INST_FLOOR)) {                  // floor terminal
             float alb = tileRSpectral(P, lambda);
             float V = sunVisibility(P + vec3(0.0, 1e-4, 0.0));
             float caus = causticTerm(P).y;
@@ -243,14 +243,14 @@ void main() {
         if (!hit) { L += skyXYZ(dir) * (Wt * Tr); break; }
         vec3 P = o + dir * hitT;
 
-        if (inst == 2u) {                    // source quad
+        if (inst == uint(INST_SOURCE)) {     // source quad
             float e = diskEmit(P, dir);
             if (e > 0.0) { L += XYZ_WHITE * (Wt * Tr * e * U_INTENSITY); break; }
             o = P + dir * 1e-4;              // transparent border, same direction
             airDist += segA;
             continue;
         }
-        if (inst == 1u) {                    // floor: diffuse + mirror branch
+        if (inst == uint(INST_FLOOR)) {      // floor: diffuse + mirror branch
             vec3 R = tileR(P);
             float ndoti = clamp(-dir.y, 0.0, 1.0);
             float F = 0.05 + 0.95 * pow(1.0 - ndoti, 5.0);

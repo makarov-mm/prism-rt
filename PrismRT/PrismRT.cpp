@@ -7,9 +7,11 @@
 //
 // Zero dependencies: vulkan-1.dll is loaded at runtime (LoadLibrary +
 // vkGetInstanceProcAddr), so nothing links against the Vulkan SDK. The SDK is
-// only needed at build time for glslc (compile_shaders.bat), same as before.
+// only needed at build time for glslc (compile_shaders.bat). The numbers the
+// host and the shaders share (bindings, grid sizes, instance ids) live in
+// layout.h, which both include.
 //
-// Single frame in flight, TLAS rebuilt per frame (one instance — trivial),
+// Single frame in flight, TLAS rebuilt per frame (three instances — trivial),
 // progressive XYZ accumulation reset on any camera/scene change, resolve
 // compute pass -> blit to swapchain.
 //
@@ -24,88 +26,94 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #include <vulkan/vulkan.h>
+
+#include "layout.h"
+
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <format>
+#include <fstream>
+#include <numbers>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
-// ============================ tiny math ================================
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
 #endif
-struct V3 { float x, y, z; };
-static V3 operator+(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 operator-(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static V3 operator*(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 cross(V3 a, V3 b) {
+
+namespace {
+
+// ============================ tiny math ================================
+
+struct V3 {
+    float x, y, z;
+    constexpr V3 operator+(V3 o) const { return { x + o.x, y + o.y, z + o.z }; }
+    constexpr V3 operator-(V3 o) const { return { x - o.x, y - o.y, z - o.z }; }
+    constexpr V3 operator*(float s) const { return { x * s, y * s, z * s }; }
+    constexpr V3 operator-() const { return { -x, -y, -z }; }
+};
+constexpr float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+constexpr V3 cross(V3 a, V3 b) {
     return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
 }
-static V3 norm(V3 a) { float l = std::sqrt(dot(a, a)); return a * (1.0f / l); }
+V3 normalize(V3 a) { return a * (1.0f / std::sqrt(dot(a, a))); }
 
-// column-major 4x4, matching GLSL std140 mat4
-struct M4 { float m[16]; };
-static M4 mul(const M4& A, const M4& B) {
-    M4 R{};
+// column-major 4x4, matching GLSL std140 mat4: m[column * 4 + row]
+struct M4 {
+    std::array<float, 16> m{};
+    float& at(int row, int col) { return m[static_cast<size_t>(col * 4 + row)]; }
+    float at(int row, int col) const { return m[static_cast<size_t>(col * 4 + row)]; }
+};
+M4 mul(const M4& a, const M4& b) {
+    M4 r;
     for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) {
-            float s = 0;
-            for (int k = 0; k < 4; ++k) s += A.m[k * 4 + r] * B.m[c * 4 + k];
-            R.m[c * 4 + r] = s;
+        for (int row = 0; row < 4; ++row) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k) s += a.at(row, k) * b.at(k, c);
+            r.at(row, c) = s;
         }
-    return R;
+    return r;
 }
-static M4 lookAt(V3 eye, V3 at, V3 up) {
-    V3 f = norm(at - eye), s = norm(cross(f, up)), u = cross(s, f);
-    M4 R{};
-    R.m[0] = s.x; R.m[4] = s.y; R.m[8]  = s.z; R.m[12] = -dot(s, eye);
-    R.m[1] = u.x; R.m[5] = u.y; R.m[9]  = u.z; R.m[13] = -dot(u, eye);
-    R.m[2] = -f.x; R.m[6] = -f.y; R.m[10] = -f.z; R.m[14] = dot(f, eye);
-    R.m[3] = 0;   R.m[7] = 0;   R.m[11] = 0;   R.m[15] = 1;
-    return R;
+
+// Inverse of the view matrix of a camera at `eye` looking at `at`: the
+// camera basis as columns, the eye as translation. Rays are generated in
+// the shader from clip space, so only the inverse is ever needed.
+M4 inverseLookAt(V3 eye, V3 at, V3 up) {
+    V3 f = normalize(at - eye), s = normalize(cross(f, up)), u = cross(s, f);
+    M4 r;
+    r.at(0, 0) = s.x;  r.at(1, 0) = s.y;  r.at(2, 0) = s.z;
+    r.at(0, 1) = u.x;  r.at(1, 1) = u.y;  r.at(2, 1) = u.z;
+    r.at(0, 2) = -f.x; r.at(1, 2) = -f.y; r.at(2, 2) = -f.z;
+    r.at(0, 3) = eye.x; r.at(1, 3) = eye.y; r.at(2, 3) = eye.z; r.at(3, 3) = 1.0f;
+    return r;
 }
-// Vulkan perspective: depth 0..1, y flipped
-static M4 perspective(float fovyDeg, float aspect, float zn, float zf) {
-    float f = 1.0f / std::tan(fovyDeg * (float)M_PI / 360.0f);
-    M4 R{};
-    R.m[0] = f / aspect;
-    R.m[5] = -f;
-    R.m[10] = zf / (zn - zf); R.m[11] = -1.0f;
-    R.m[14] = zn * zf / (zn - zf);
-    return R;
+
+// Inverse of the Vulkan perspective (depth 0..1, y flipped):
+//   P = [f/a 0 0 0; 0 -f 0 0; 0 0 A B; 0 0 -1 0],  A = zf/(zn-zf), B = zn*zf/(zn-zf)
+M4 inversePerspective(float fovyDeg, float aspect, float zn, float zf) {
+    const float f = 1.0f / std::tan(fovyDeg * std::numbers::pi_v<float> / 360.0f);
+    const float A = zf / (zn - zf), B = zn * zf / (zn - zf);
+    M4 r;
+    r.at(0, 0) = aspect / f;
+    r.at(1, 1) = -1.0f / f;
+    r.at(2, 3) = -1.0f;
+    r.at(3, 2) = 1.0f / B;
+    r.at(3, 3) = A / B;
+    return r;
 }
-// general 4x4 inverse (adjugate) — the classic gluInvertMatrix routine
-static M4 inverse(const M4& s) {
-    const float* m = s.m;
-    M4 o{}; float* inv = o.m;
-    inv[0] = m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
-    inv[4] = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
-    inv[8] = m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
-    inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
-    inv[1] = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
-    inv[5] = m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
-    inv[9] = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
-    inv[13] = m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
-    inv[2] = m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
-    inv[6] = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
-    inv[10] = m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
-    inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
-    inv[3] = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
-    inv[7] = m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
-    inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
-    inv[15] = m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
-    float det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
-    det = 1.0f / det;
-    for (int i = 0; i < 16; ++i) inv[i] *= det;
-    return o;
-}
+
+constexpr float degToRad(float d) { return d * std::numbers::pi_v<float> / 180.0f; }
 
 // ===================== Vulkan dynamic loader ============================
-static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
-static PFN_vkGetDeviceProcAddr   vkGetDeviceProcAddr;
+
+PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
+PFN_vkGetDeviceProcAddr   vkGetDeviceProcAddr;
 
 #define VK_GLOBAL_FNS(X) \
     X(vkCreateInstance)
@@ -188,40 +196,45 @@ static PFN_vkGetDeviceProcAddr   vkGetDeviceProcAddr;
     X(vkGetAccelerationStructureDeviceAddressKHR) \
     X(vkGetBufferDeviceAddress)
 
-#define VKFN_DECL(n) static PFN_##n n;
+#define VKFN_DECL(n) PFN_##n n;
 VK_GLOBAL_FNS(VKFN_DECL)
 VK_INSTANCE_FNS(VKFN_DECL)
 VK_DEVICE_FNS(VKFN_DECL)
 
-static void fatal(const char* msg) {
-    MessageBoxA(nullptr, msg, "PrismRT", MB_ICONERROR);
+[[noreturn]] void fatal(const std::string& msg) {
+    MessageBoxA(nullptr, msg.c_str(), "PrismRT", MB_ICONERROR);
     ExitProcess(1);
 }
-#define VK_CHECK(call) do { VkResult _r = (call); if (_r != VK_SUCCESS) { \
-    char _b[256]; snprintf(_b, 256, "%s\nfailed with VkResult %d", #call, (int)_r); \
-    fatal(_b); } } while (0)
+void vkCheck(VkResult r, std::string_view what) {
+    if (r != VK_SUCCESS) fatal(std::format("{}\nfailed with VkResult {}", what, static_cast<int>(r)));
+}
+#define VK_CHECK(call) vkCheck((call), #call)
 
 // ========================= app / scene state ============================
+
 struct SceneUBO {                    // std140 mirror of common.glsl SceneUBO
     float    invViewProj[16];
     float    camPos[4];
     float    lightDir[4];            // xyz toward light, w = cos(half-angle)
     float    srcPosRadius[4];        // xyz aperture centre, w radius
-    uint32_t dimsFrameSpp[4];
+    uint32_t dimsFrameSpp[4];        // w, h, frameIndex, spp
     uint32_t misc[4];                // glassSF10, maxDepth, bits(intensity), bits(fogSigma)
 };
 static_assert(sizeof(SceneUBO) == 144, "UBO layout");
 
-static uint32_t bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+constexpr uint32_t kMaxDepth = 10;
+constexpr float kBeamIntensity = 420.0f;
+constexpr float kSourceHalfAngleDeg = 0.35f;
+constexpr std::array<float, 4> kFog{ 0.0f, 0.15f, 0.35f, 0.7f };
 
-struct AppState {
+struct App {
     // orbit camera
     double yaw = 0.35, pitch = 0.22, dist = 3.0;
     // prism rotation
     double prismYawY = 0.0, prismTiltZ = 0.0;
     bool   sf10 = true;
     float  exposure = 0.7f;   // ACES lifts midtones vs Reinhard; compensate
-    int    fogIdx = 2;               // index into kFog
+    int    fogIdx = 2;        // index into kFog
     bool   reset = true;
     bool   quit = false;
     bool   sizeDirty = false;
@@ -229,10 +242,9 @@ struct AppState {
     bool   dragL = false, dragR = false;
     POINT  lastMouse{};
 };
-static const float kFog[4] = { 0.0f, 0.15f, 0.35f, 0.7f };
-static AppState g;
+App g;
 
-static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_SIZE:
         g.winW = LOWORD(lp); g.winH = HIWORD(lp);
@@ -245,14 +257,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE:
         if (g.dragL || g.dragR) {
             POINT p; GetCursorPos(&p);
-            double dx = p.x - g.lastMouse.x, dy = p.y - g.lastMouse.y;
+            const double dx = p.x - g.lastMouse.x, dy = p.y - g.lastMouse.y;
             g.lastMouse = p;
             if (g.dragL) {
-                g.yaw   += dx * 0.008;
+                g.yaw += dx * 0.008;
                 g.pitch = std::clamp(g.pitch + dy * 0.008, -1.35, 1.35);
             }
             if (g.dragR) {
-                g.prismYawY  += dx * 0.008;
+                g.prismYawY += dx * 0.008;
                 g.prismTiltZ += dy * 0.008;
             }
             g.reset = true;
@@ -266,19 +278,56 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         switch (wp) {
         case VK_ESCAPE: g.quit = true; break;
         case 'G': g.sf10 = !g.sf10; g.reset = true; break;
-        case 'F': g.fogIdx = (g.fogIdx + 1) % 4; g.reset = true; break;
+        case 'F': g.fogIdx = (g.fogIdx + 1) % static_cast<int>(kFog.size()); g.reset = true; break;
         case 'R': g.reset = true; break;
         case VK_OEM_PLUS:  case VK_ADD:      g.exposure *= 1.25f; break;
         case VK_OEM_MINUS: case VK_SUBTRACT: g.exposure /= 1.25f; break;
         }
         return 0;
+    case WM_DPICHANGED: {   // moved to a monitor with another scale: take the suggested rect
+        const RECT& s = *reinterpret_cast<const RECT*>(lp);
+        SetWindowPos(h, nullptr, s.left, s.top, s.right - s.left, s.bottom - s.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
     case WM_CLOSE: g.quit = true; return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProc(h, m, wp, lp);
 }
 
+// Per-monitor DPI awareness: the swapchain gets the monitor's real pixels
+// instead of a bitmap-scaled window. The user32 entry points are resolved at
+// runtime so the exe still starts on Windows versions without them.
+template <typename Fn>
+Fn user32Fn(const char* name) {
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    return user32 ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(user32, name))) : nullptr;
+}
+
+void enableDpiAwareness() {
+    if (auto fn = user32Fn<BOOL(WINAPI*)(HANDLE)>("SetProcessDpiAwarenessContext"))
+        fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));  // ..._PER_MONITOR_AWARE_V2
+}
+
+// 96 on an unscaled display, 192 at 200 %.
+UINT systemDpi() {
+    if (auto fn = user32Fn<UINT(WINAPI*)()>("GetDpiForSystem")) return fn();
+    return USER_DEFAULT_SCREEN_DPI;
+}
+
+// Window rect for a client area of w x h pixels, with the frame sized for `dpi`.
+RECT windowRectFor(int w, int h, UINT dpi) {
+    RECT r{ 0, 0, w, h };
+    if (auto fn = user32Fn<BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT)>("AdjustWindowRectExForDpi"))
+        fn(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    else
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    return r;
+}
+
 // ====================== Vulkan context + helpers ========================
+
 struct Vk {
     VkInstance instance{};
     VkSurfaceKHR surface{};
@@ -294,11 +343,10 @@ struct Vk {
     VkSemaphore semAcquire{}, semRender{};
 
     VkSwapchainKHR swapchain{};
-    VkFormat swapFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D extent{};
     std::vector<VkImage> swapImages;
 };
-static Vk vk;
+Vk vk;
 
 struct Buffer {
     VkBuffer buf{};
@@ -307,285 +355,377 @@ struct Buffer {
     VkDeviceAddress addr = 0;
 };
 
-static uint32_t findMemType(uint32_t typeBits, VkMemoryPropertyFlags props) {
+constexpr VkMemoryPropertyFlags kHostMem =
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags kDeviceMem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+uint32_t findMemType(uint32_t typeBits, VkMemoryPropertyFlags props) {
     for (uint32_t i = 0; i < vk.memProps.memoryTypeCount; ++i)
-        if ((typeBits & (1u << i)) &&
-            (vk.memProps.memoryTypes[i].propertyFlags & props) == props)
+        if ((typeBits & (1u << i)) && (vk.memProps.memoryTypes[i].propertyFlags & props) == props)
             return i;
     fatal("no suitable memory type");
-    return 0;
 }
 
-static Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                           VkMemoryPropertyFlags memFlags, bool wantAddr) {
+Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags memFlags,
+                    bool wantAddr) {
     Buffer b;
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bi.size = size;
-    bi.usage = usage | (wantAddr ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const VkBufferCreateInfo bi{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage | (wantAddr ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
     VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &b.buf));
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(vk.device, b.buf, &req);
-    VkMemoryAllocateFlagsInfo fi{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-    fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    ai.pNext = wantAddr ? &fi : nullptr;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = findMemType(req.memoryTypeBits, memFlags);
+    const VkMemoryAllocateFlagsInfo flags{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    const VkMemoryAllocateInfo ai{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = wantAddr ? &flags : nullptr,
+        .allocationSize = req.size,
+        .memoryTypeIndex = findMemType(req.memoryTypeBits, memFlags),
+    };
     VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &b.mem));
     VK_CHECK(vkBindBufferMemory(vk.device, b.buf, b.mem, 0));
 
     if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         VK_CHECK(vkMapMemory(vk.device, b.mem, 0, VK_WHOLE_SIZE, 0, &b.mapped));
     if (wantAddr) {
-        VkBufferDeviceAddressInfo dai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
-        dai.buffer = b.buf;
+        const VkBufferDeviceAddressInfo dai{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b.buf };
         b.addr = vkGetBufferDeviceAddress(vk.device, &dai);
     }
     return b;
 }
 
-struct ImageRT {
+// Host-visible buffer filled with `data` (geometry, instances, SBTs).
+template <typename T>
+Buffer createFilledBuffer(std::span<const T> data, VkBufferUsageFlags usage, bool wantAddr) {
+    Buffer b = createBuffer(data.size_bytes(), usage, kHostMem, wantAddr);
+    std::memcpy(b.mapped, data.data(), data.size_bytes());
+    return b;
+}
+
+void destroyBuffer(Buffer& b) {
+    if (b.buf) vkDestroyBuffer(vk.device, b.buf, nullptr);
+    if (b.mem) vkFreeMemory(vk.device, b.mem, nullptr);
+    b = {};
+}
+
+constexpr VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) & ~(a - 1); }
+
+struct Image {
     VkImage img{};
     VkDeviceMemory mem{};
     VkImageView view{};
 };
-static ImageRT createStorageImage(VkFormat fmt, uint32_t w, uint32_t h,
-                                  VkImageUsageFlags usage) {
-    ImageRT im;
-    VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ii.imageType = VK_IMAGE_TYPE_2D;
-    ii.format = fmt;
-    ii.extent = { w, h, 1 };
-    ii.mipLevels = 1; ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = usage;
-    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+Image createStorageImage(VkFormat fmt, uint32_t w, uint32_t h, VkImageUsageFlags usage) {
+    Image im;
+    const VkImageCreateInfo ii{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = fmt,
+        .extent = { w, h, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
     VK_CHECK(vkCreateImage(vk.device, &ii, nullptr, &im.img));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.device, im.img, &req);
-    VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = findMemType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryAllocateInfo ai{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = findMemType(req.memoryTypeBits, kDeviceMem),
+    };
     VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &im.mem));
     VK_CHECK(vkBindImageMemory(vk.device, im.img, im.mem, 0));
-    VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-    vi.image = im.img;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = fmt;
-    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    const VkImageViewCreateInfo vi{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = im.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
     VK_CHECK(vkCreateImageView(vk.device, &vi, nullptr, &im.view));
     return im;
 }
-static void destroyImage(ImageRT& im) {
+
+void destroyImage(Image& im) {
     if (im.view) vkDestroyImageView(vk.device, im.view, nullptr);
     if (im.img)  vkDestroyImage(vk.device, im.img, nullptr);
     if (im.mem)  vkFreeMemory(vk.device, im.mem, nullptr);
     im = {};
 }
 
-static void barrierImage(VkCommandBuffer cmd, VkImage img,
-                         VkImageLayout oldL, VkImageLayout newL,
-                         VkAccessFlags srcA, VkAccessFlags dstA,
-                         VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
-    VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    b.oldLayout = oldL; b.newLayout = newL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+void barrierImage(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
+                  VkAccessFlags srcA, VkAccessFlags dstA,
+                  VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+    const VkImageMemoryBarrier b{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = srcA,
+        .dstAccessMask = dstA,
+        .oldLayout = oldL,
+        .newLayout = newL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
     vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-static std::vector<char> loadFile(const char* rel) {
-    // probe a few locations so the exe works from the build dir or repo root
-    const char* prefixes[] = { "", "spv/", "PrismRT/spv/", "../../PrismRT/spv/", "..\\..\\PrismRT\\spv\\" };
-    for (const char* p : prefixes) {
-        std::string path = std::string(p) + rel;
-        FILE* f = nullptr;
-        if (fopen_s(&f, path.c_str(), "rb") == 0 && f) {
-            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-            std::vector<char> data((size_t)n);
-            fread(data.data(), 1, (size_t)n, f);
-            fclose(f);
-            return data;
-        }
-    }
-    std::string msg = std::string("cannot find ") + rel +
-        "\nRun compile_shaders.bat first (needs glslc from the Vulkan SDK).";
-    fatal(msg.c_str());
-    return {};
+void barrierMemory(VkCommandBuffer cmd, VkAccessFlags srcA, VkAccessFlags dstA,
+                   VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+    const VkMemoryBarrier b{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = srcA, .dstAccessMask = dstA };
+    vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 1, &b, 0, nullptr, 0, nullptr);
 }
-static VkShaderModule loadShader(const char* rel) {
-    std::vector<char> code = loadFile(rel);
-    VkShaderModuleCreateInfo ci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    ci.codeSize = code.size();
-    ci.pCode = (const uint32_t*)code.data();
+
+// Runs the recorded commands on the queue and waits (setup-time builds).
+template <typename Record>
+void submitAndWait(Record&& record) {
+    const VkCommandBufferBeginInfo cbi{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_CHECK(vkBeginCommandBuffer(vk.cmd, &cbi));
+    record(vk.cmd);
+    VK_CHECK(vkEndCommandBuffer(vk.cmd));
+    const VkSubmitInfo si{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &vk.cmd };
+    VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(vk.queue));
+}
+
+// SPIR-V from the spv/ folder next to the sources; a few locations are
+// probed so the exe works from the build directory or the repo root.
+std::vector<uint32_t> loadSpirv(std::string_view name) {
+    constexpr std::array<std::string_view, 5> prefixes{
+        "", "spv/", "PrismRT/spv/", "../../PrismRT/spv/", "..\\..\\PrismRT\\spv\\" };
+    for (std::string_view prefix : prefixes) {
+        std::ifstream file(std::string(prefix) + std::string(name), std::ios::binary | std::ios::ate);
+        if (!file) continue;
+        const std::streamsize size = file.tellg();
+        if (size <= 0 || size % 4 != 0) fatal(std::format("{} is not a SPIR-V module", name));
+        std::vector<uint32_t> words(static_cast<size_t>(size) / 4);
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(words.data()), size);
+        if (words[0] != 0x07230203u) fatal(std::format("{} is not a SPIR-V module", name));
+        return words;
+    }
+    fatal(std::format("cannot find {}\nRun compile_shaders.bat first (needs glslc from the Vulkan SDK).",
+                      name));
+}
+
+VkShaderModule loadShader(std::string_view name) {
+    const std::vector<uint32_t> code = loadSpirv(name);
+    const VkShaderModuleCreateInfo ci{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = code.size() * sizeof(uint32_t),
+        .pCode = code.data(),
+    };
     VkShaderModule m;
     VK_CHECK(vkCreateShaderModule(vk.device, &ci, nullptr, &m));
     return m;
 }
 
 // ============================ init ======================================
-static void initVulkan(HWND hWnd, HINSTANCE hInst) {
+
+constexpr std::array<const char*, 4> kDeviceExtensions{
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+};
+
+bool supportsExtensions(VkPhysicalDevice d) {
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> exts(n);
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, exts.data());
+    return std::ranges::all_of(kDeviceExtensions, [&](const char* need) {
+        return std::ranges::any_of(exts, [&](const VkExtensionProperties& e) {
+            return std::strcmp(e.extensionName, need) == 0; });
+    });
+}
+
+// A graphics + compute queue family that can present to the surface, or -1.
+int findQueueFamily(VkPhysicalDevice d) {
+    uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(d, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> families(n);
+    vkGetPhysicalDeviceQueueFamilyProperties(d, &n, families.data());
+    constexpr VkQueueFlags needed = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+    for (uint32_t i = 0; i < n; ++i) {
+        VkBool32 present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(d, i, vk.surface, &present);
+        if ((families[i].queueFlags & needed) == needed && present) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void initVulkan(HWND hWnd, HINSTANCE hInst) {
     HMODULE dll = LoadLibraryA("vulkan-1.dll");
     if (!dll) fatal("vulkan-1.dll not found — install a Vulkan driver.");
-    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(dll, "vkGetInstanceProcAddr");
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        reinterpret_cast<void*>(GetProcAddress(dll, "vkGetInstanceProcAddr")));
     if (!vkGetInstanceProcAddr) fatal("vkGetInstanceProcAddr not found");
-#define VKFN_GLOBAL(n) n = (PFN_##n)vkGetInstanceProcAddr(nullptr, #n);
+#define VKFN_GLOBAL(n) n = reinterpret_cast<PFN_##n>(vkGetInstanceProcAddr(nullptr, #n));
     VK_GLOBAL_FNS(VKFN_GLOBAL)
 
-    VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    app.pApplicationName = "PrismRT";
-    app.apiVersion = VK_API_VERSION_1_2;
-    const char* instExts[] = { VK_KHR_SURFACE_EXTENSION_NAME,
-                               VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
-    VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-    ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 2;
-    ici.ppEnabledExtensionNames = instExts;
+    const VkApplicationInfo app{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "PrismRT",
+        .apiVersion = VK_API_VERSION_1_2,
+    };
+    constexpr std::array<const char*, 2> instExts{
+        VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+    const VkInstanceCreateInfo ici{
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app,
+        .enabledExtensionCount = static_cast<uint32_t>(instExts.size()),
+        .ppEnabledExtensionNames = instExts.data(),
+    };
     VK_CHECK(vkCreateInstance(&ici, nullptr, &vk.instance));
-#define VKFN_INST(n) n = (PFN_##n)vkGetInstanceProcAddr(vk.instance, #n);
+#define VKFN_INST(n) n = reinterpret_cast<PFN_##n>(vkGetInstanceProcAddr(vk.instance, #n));
     VK_INSTANCE_FNS(VKFN_INST)
-    vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(vk.instance, "vkGetDeviceProcAddr");
+    vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        vkGetInstanceProcAddr(vk.instance, "vkGetDeviceProcAddr"));
 
-    VkWin32SurfaceCreateInfoKHR sci{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
-    sci.hinstance = hInst;
-    sci.hwnd = hWnd;
+    const VkWin32SurfaceCreateInfoKHR sci{
+        .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR, .hinstance = hInst, .hwnd = hWnd };
     VK_CHECK(vkCreateWin32SurfaceKHR(vk.instance, &sci, nullptr, &vk.surface));
 
-    // pick a physical device with the RT extensions + a graphics/present queue
-    const char* devExts[] = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-    };
+    // pick a device with the RT extensions and a graphics/present queue;
+    // a discrete GPU wins over an integrated one that also qualifies
     uint32_t ndev = 0;
     VK_CHECK(vkEnumeratePhysicalDevices(vk.instance, &ndev, nullptr));
-    if (!ndev) fatal("no Vulkan devices");
     std::vector<VkPhysicalDevice> devs(ndev);
     VK_CHECK(vkEnumeratePhysicalDevices(vk.instance, &ndev, devs.data()));
+    int bestScore = -1;
     for (VkPhysicalDevice d : devs) {
-        uint32_t nx = 0;
-        vkEnumerateDeviceExtensionProperties(d, nullptr, &nx, nullptr);
-        std::vector<VkExtensionProperties> exts(nx);
-        vkEnumerateDeviceExtensionProperties(d, nullptr, &nx, exts.data());
-        int found = 0;
-        for (const char* need : devExts)
-            for (auto& e : exts)
-                if (!strcmp(e.extensionName, need)) { ++found; break; }
-        if (found != 4) continue;
-        uint32_t nq = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(d, &nq, nullptr);
-        std::vector<VkQueueFamilyProperties> qs(nq);
-        vkGetPhysicalDeviceQueueFamilyProperties(d, &nq, qs.data());
-        for (uint32_t i = 0; i < nq; ++i) {
-            VkBool32 present = VK_FALSE;
-            vkGetPhysicalDeviceSurfaceSupportKHR(d, i, vk.surface, &present);
-            if ((qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) {
-                vk.phys = d; vk.queueFamily = i;
-                break;
-            }
+        if (!supportsExtensions(d)) continue;
+        const int family = findQueueFamily(d);
+        if (family < 0) continue;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(d, &props);
+        const int score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+        if (score > bestScore) {
+            bestScore = score;
+            vk.phys = d;
+            vk.queueFamily = static_cast<uint32_t>(family);
         }
-        if (vk.phys) break;
     }
     if (!vk.phys)
         fatal("No GPU with VK_KHR_ray_tracing_pipeline found.\n"
               "Hardware ray tracing support is required.");
 
     vkGetPhysicalDeviceMemoryProperties(vk.phys, &vk.memProps);
-    vk.rtProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
-    VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-    p2.pNext = &vk.rtProps;
+    vk.rtProps = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
+    VkPhysicalDeviceProperties2 p2{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &vk.rtProps };
     vkGetPhysicalDeviceProperties2(vk.phys, &p2);
 
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-    qci.queueFamilyIndex = vk.queueFamily;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
-
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtf{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
-    rtf.rayTracingPipeline = VK_TRUE;
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR asf{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
-    asf.accelerationStructure = VK_TRUE;
-    asf.pNext = &rtf;
+    const float priority = 1.0f;
+    const VkDeviceQueueCreateInfo qci{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = vk.queueFamily,
+        .queueCount = 1,
+        .pQueuePriorities = &priority,
+    };
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+        .rayTracingPipeline = VK_TRUE,
+    };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        .pNext = &rtFeatures,
+        .accelerationStructure = VK_TRUE,
+    };
     VkPhysicalDeviceVulkan12Features v12{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
-    v12.bufferDeviceAddress = VK_TRUE;
-    v12.scalarBlockLayout = VK_TRUE;
-    v12.pNext = &asf;
-
-    VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    dci.pNext = &v12;
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 4;
-    dci.ppEnabledExtensionNames = devExts;
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &asFeatures,
+        .scalarBlockLayout = VK_TRUE,
+        .bufferDeviceAddress = VK_TRUE,
+    };
+    const VkDeviceCreateInfo dci{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &v12,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &qci,
+        .enabledExtensionCount = static_cast<uint32_t>(kDeviceExtensions.size()),
+        .ppEnabledExtensionNames = kDeviceExtensions.data(),
+    };
     VK_CHECK(vkCreateDevice(vk.phys, &dci, nullptr, &vk.device));
-#define VKFN_DEV(n) n = (PFN_##n)vkGetDeviceProcAddr(vk.device, #n);
+#define VKFN_DEV(n) n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(vk.device, #n));
     VK_DEVICE_FNS(VKFN_DEV)
     vkGetDeviceQueue(vk.device, vk.queueFamily, 0, &vk.queue);
 
-    VkCommandPoolCreateInfo cpi{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpi.queueFamilyIndex = vk.queueFamily;
+    const VkCommandPoolCreateInfo cpi{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = vk.queueFamily,
+    };
     VK_CHECK(vkCreateCommandPool(vk.device, &cpi, nullptr, &vk.cmdPool));
-    VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cai.commandPool = vk.cmdPool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
+    const VkCommandBufferAllocateInfo cai{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk.cmdPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
     VK_CHECK(vkAllocateCommandBuffers(vk.device, &cai, &vk.cmd));
 
-    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    const VkFenceCreateInfo fci{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
     VK_CHECK(vkCreateFence(vk.device, &fci, nullptr, &vk.fence));
-    VkSemaphoreCreateInfo semci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    const VkSemaphoreCreateInfo semci{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     VK_CHECK(vkCreateSemaphore(vk.device, &semci, nullptr, &vk.semAcquire));
     VK_CHECK(vkCreateSemaphore(vk.device, &semci, nullptr, &vk.semRender));
 }
 
-static void createSwapchain() {
+void createSwapchain() {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps));
     vk.extent = caps.currentExtent;
-    if (vk.extent.width == 0xFFFFFFFFu) {
-        vk.extent = { (uint32_t)g.winW, (uint32_t)g.winH };
-    }
+    if (vk.extent.width == 0xFFFFFFFFu)
+        vk.extent = { static_cast<uint32_t>(g.winW), static_cast<uint32_t>(g.winH) };
 
     uint32_t nf = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(vk.phys, vk.surface, &nf, nullptr);
-    std::vector<VkSurfaceFormatKHR> fmts(nf);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.phys, vk.surface, &nf, fmts.data());
-    VkSurfaceFormatKHR pick = fmts[0];
-    for (auto& f : fmts)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { pick = f; break; }
-    vk.swapFormat = pick.format;
+    std::vector<VkSurfaceFormatKHR> formats(nf);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.phys, vk.surface, &nf, formats.data());
+    auto preferred = std::ranges::find(formats, VK_FORMAT_B8G8R8A8_UNORM, &VkSurfaceFormatKHR::format);
+    const VkSurfaceFormatKHR pick = preferred != formats.end() ? *preferred : formats.at(0);
 
-    uint32_t imgCount = caps.minImageCount + 1;
-    if (caps.maxImageCount && imgCount > caps.maxImageCount) imgCount = caps.maxImageCount;
+    uint32_t imageCount = caps.minImageCount + 1;
+    if (caps.maxImageCount) imageCount = std::min(imageCount, caps.maxImageCount);
 
-    VkSwapchainCreateInfoKHR sci{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
-    sci.surface = vk.surface;
-    sci.minImageCount = imgCount;
-    sci.imageFormat = pick.format;
-    sci.imageColorSpace = pick.colorSpace;
-    sci.imageExtent = vk.extent;
-    sci.imageArrayLayers = 1;
-    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
-    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;   // vsync, always available
-    sci.clipped = VK_TRUE;
-    sci.oldSwapchain = vk.swapchain;
+    const VkSwapchainCreateInfoKHR sci{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = vk.surface,
+        .minImageCount = imageCount,
+        .imageFormat = pick.format,
+        .imageColorSpace = pick.colorSpace,
+        .imageExtent = vk.extent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform = caps.currentTransform,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   // vsync, always available
+        .clipped = VK_TRUE,
+        .oldSwapchain = vk.swapchain,
+    };
     VkSwapchainKHR newSwap;
     VK_CHECK(vkCreateSwapchainKHR(vk.device, &sci, nullptr, &newSwap));
     if (vk.swapchain) vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
@@ -598,10 +738,11 @@ static void createSwapchain() {
 }
 
 // ================= geometry, BLAS/TLAS, pipelines, SBT ==================
+
 // Prism mesh: triangle in XY (apex up), extruded along Z. Same cross-section
 // as the 2D renderers. Winding is irrelevant — the closest-hit derives the
 // geometric normal and orients it against the ray.
-static const float kPrismPos[] = {
+constexpr std::array<float, 18> kPrismPos{
      0.000f,  0.620f,  0.550f,
     -0.520f, -0.280f,  0.550f,
      0.520f, -0.280f,  0.550f,
@@ -609,448 +750,412 @@ static const float kPrismPos[] = {
     -0.520f, -0.280f, -0.550f,
      0.520f, -0.280f, -0.550f,
 };
-static const uint32_t kPrismIdx[] = {
+constexpr std::array<uint32_t, 24> kPrismIdx{
     0,1,2,  3,5,4,          // caps
     0,3,4,  0,4,1,          // A-B side
     1,4,5,  1,5,2,          // B-C side
     2,5,3,  2,3,0,          // C-A side
 };
-static const uint32_t kPrimCount = 8;
-
-struct RT {
-    Buffer posBuf, idxBuf, uboBuf, instBuf, sbtBuf;
-    Buffer floorPosBuf, floorIdxBuf, quadPosBuf, quadIdxBuf;
-    Buffer prismBlasBuf, prismScratch, floorBlasBuf, floorScratch;
-    Buffer quadBlasBuf, quadScratch;
-    Buffer tlasBuf, tlasScratch;
-    VkAccelerationStructureKHR prismBlas{}, floorBlas{}, quadBlas{}, tlas{};
-    VkDeviceAddress prismBlasAddr = 0, floorBlasAddr = 0, quadBlasAddr = 0;
-
-    Buffer gridBuf, causBuf;                 // photon fog grid + floor caustic
-    Buffer photonSbtBuf;
-
-    VkDescriptorSetLayout rtSetLayout{}, resSetLayout{};
-    VkDescriptorPool descPool{};
-    VkDescriptorSet rtSet{}, resSet{};
-    VkPipelineLayout rtLayout{}, resLayout{};
-    VkPipeline rtPipe{}, photonPipe{}, resPipe{};
-
-    VkStridedDeviceAddressRegionKHR sbtRgen{}, sbtMiss{}, sbtHit{}, sbtCall{};
-    VkStridedDeviceAddressRegionKHR phRgen{}, phMiss{}, phHit{}, phCall{};
-
-    ImageRT accum, outImg;
-
-    // persistent TLAS build description (rebuilt each frame, one instance)
-    VkAccelerationStructureGeometryKHR tlasGeom{};
-    VkAccelerationStructureBuildGeometryInfoKHR tlasBuild{};
-};
-static RT rt;
-
-static VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) & ~(a - 1); }
-
-// photon storage dimensions — must match common.glsl
-static const uint32_t kGridX = 148, kGridY = 52, kGridZ = 40;
-static const uint32_t kCausX = 384, kCausZ = 384;
-static const VkDeviceSize kGridBytes = (VkDeviceSize)kGridX * kGridY * kGridZ * 3 * 4;
-static const VkDeviceSize kCausBytes = (VkDeviceSize)kCausX * kCausZ * 3 * 4;
 
 // floor: large quad at y=0 in local space; the TLAS instance drops it to the
 // prism base. The closest-hit never fetches its geometry (normal is +Y).
 // Big enough that its far edge is fully swallowed by fog attenuation.
-static const float kFloorPos[] = {
+constexpr std::array<float, 12> kFloorPos{
     -120.0f, 0.0f, -120.0f,
      120.0f, 0.0f, -120.0f,
      120.0f, 0.0f,  120.0f,
     -120.0f, 0.0f,  120.0f,
 };
-static const uint32_t kFloorIdx[] = { 0,1,2,  0,2,3 };
+constexpr std::array<uint32_t, 6> kQuadIdx{ 0,1,2,  0,2,3 };
+constexpr float kFloorY = static_cast<float>(FLOOR_PLANE_Y);   // just below the prism base (y = -0.28)
 
 // collimated beam, same geometry as the 2D renderers (in the XY plane).
-// The SOURCE IS GEOMETRY: an emissive quad at the aperture (TLAS instance 2)
-// so light connections hit it before the floor behind it — evaluating the
-// aperture in the miss shader never fires when geometry lies past the source.
-static const float kBeamDeg = 24.0f;
-static V3 beamD() {
-    return { std::cos(kBeamDeg * (float)M_PI / 180.0f),
-             std::sin(kBeamDeg * (float)M_PI / 180.0f), 0.0f };
-}
-static V3 beamSrcPos() { V3 D = beamD(); return V3{ -0.24f, 0.20f, 0.0f } - D * 1.15f; }
-static const float kBeamRadius = 0.085f;
-static const float kQuadHalf = 0.11f;   // quad slightly over the soft disk edge
+// The SOURCE IS GEOMETRY: an emissive quad at the aperture (TLAS instance
+// INST_SOURCE) so light connections hit it before the floor behind it —
+// evaluating the aperture in the miss shader never fires when geometry lies
+// past the source.
+constexpr float kBeamDeg = 24.0f;
+constexpr float kBeamRadius = 0.085f;
+constexpr float kQuadHalf = 0.11f;   // quad slightly over the soft disk edge
+V3 beamDir() { return { std::cos(degToRad(kBeamDeg)), std::sin(degToRad(kBeamDeg)), 0.0f }; }
+V3 beamSourcePos() { return V3{ -0.24f, 0.20f, 0.0f } - beamDir() * 1.15f; }
 
-struct BlasOut {
-    VkAccelerationStructureKHR as;
-    VkDeviceAddress addr;
+constexpr VkDeviceSize kGridBytes = VkDeviceSize{ GRID_X } * GRID_Y * GRID_Z * 3 * sizeof(uint32_t);
+constexpr VkDeviceSize kCausBytes = VkDeviceSize{ CAUS_X } * CAUS_Z * 3 * sizeof(uint32_t);
+
+struct Blas {
+    Buffer positions, indices, storage;
+    VkAccelerationStructureKHR as{};
+    VkDeviceAddress addr = 0;
 };
-static BlasOut buildOneBLAS(const Buffer& posBuf, uint32_t maxVertex,
-                            const Buffer& idxBuf, uint32_t primCount,
-                            Buffer& asBuf, Buffer& scratch) {
-    VkAccelerationStructureGeometryKHR geom{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
-    geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    auto& tri = geom.geometry.triangles;
-    tri.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    tri.vertexData.deviceAddress = posBuf.addr;
-    tri.vertexStride = 12;
-    tri.maxVertex = maxVertex;
-    tri.indexType = VK_INDEX_TYPE_UINT32;
-    tri.indexData.deviceAddress = idxBuf.addr;
 
-    VkAccelerationStructureBuildGeometryInfoKHR bi{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
-    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    bi.geometryCount = 1;
-    bi.pGeometries = &geom;
+struct RT {
+    Blas prism, floor, source;
+    Buffer instBuf, tlasBuf, tlasScratch;
+    VkAccelerationStructureKHR tlas{};
 
-    VkAccelerationStructureBuildSizesInfoKHR sz{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-    uint32_t prims = primCount;
-    vkGetAccelerationStructureBuildSizesKHR(vk.device,
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &prims, &sz);
+    Buffer uboBuf;
+    Buffer gridBuf, causBuf;                 // photon fog grid + floor caustic
+    Buffer cameraSbt, photonSbt;
 
-    asBuf = createBuffer(sz.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
-    scratch = createBuffer(sz.buildScratchSize + 256,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+    VkDescriptorSetLayout rtSetLayout{}, resSetLayout{};
+    VkDescriptorPool descPool{};
+    VkDescriptorSet rtSet{}, resSet{};
+    VkPipelineLayout rtLayout{}, resLayout{};
+    VkPipeline cameraPipe{}, photonPipe{}, resPipe{};
 
-    VkAccelerationStructureCreateInfoKHR aci{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
-    aci.buffer = asBuf.buf;
-    aci.size = sz.accelerationStructureSize;
-    aci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    BlasOut out{};
+    struct SbtRegions { VkStridedDeviceAddressRegionKHR rgen{}, miss{}, hit{}, call{}; };
+    SbtRegions cameraRegions, photonRegions;
+
+    Image accum, outImg;
+
+    // persistent TLAS build description (rebuilt each frame)
+    VkAccelerationStructureGeometryKHR tlasGeom{};
+    VkAccelerationStructureBuildGeometryInfoKHR tlasBuild{};
+};
+RT rt;
+
+Blas buildBlas(std::span<const float> positions, std::span<const uint32_t> indices) {
+    constexpr VkBufferUsageFlags geoUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    Blas out;
+    out.positions = createFilledBuffer(positions, geoUsage, true);
+    out.indices = createFilledBuffer(indices, geoUsage, true);
+    const uint32_t primCount = static_cast<uint32_t>(indices.size() / 3);
+
+    const VkAccelerationStructureGeometryKHR geom{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+        .geometry = { .triangles = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+            .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+            .vertexData = { .deviceAddress = out.positions.addr },
+            .vertexStride = 3 * sizeof(float),
+            .maxVertex = static_cast<uint32_t>(positions.size() / 3 - 1),
+            .indexType = VK_INDEX_TYPE_UINT32,
+            .indexData = { .deviceAddress = out.indices.addr },
+        } },
+        .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    };
+    VkAccelerationStructureBuildGeometryInfoKHR build{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .geometryCount = 1,
+        .pGeometries = &geom,
+    };
+    VkAccelerationStructureBuildSizesInfoKHR sizes{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+    vkGetAccelerationStructureBuildSizesKHR(vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                            &build, &primCount, &sizes);
+
+    out.storage = createBuffer(sizes.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, kDeviceMem, true);
+    Buffer scratch = createBuffer(sizes.buildScratchSize + 256,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kDeviceMem, true);
+
+    const VkAccelerationStructureCreateInfoKHR aci{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+        .buffer = out.storage.buf,
+        .size = sizes.accelerationStructureSize,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    };
     VK_CHECK(vkCreateAccelerationStructureKHR(vk.device, &aci, nullptr, &out.as));
+    build.dstAccelerationStructure = out.as;
+    build.scratchData.deviceAddress = alignUp(scratch.addr, 256);
 
-    bi.dstAccelerationStructure = out.as;
-    bi.scratchData.deviceAddress = alignUp(scratch.addr, 256);
-
-    VkAccelerationStructureBuildRangeInfoKHR range{};
-    range.primitiveCount = primCount;
+    const VkAccelerationStructureBuildRangeInfoKHR range{ .primitiveCount = primCount };
     const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
+    submitAndWait([&](VkCommandBuffer cmd) {
+        vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build, &pRange);
+    });
+    destroyBuffer(scratch);   // a BLAS is built once; the scratch is not needed again
 
-    VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(vk.cmd, &cbi));
-    vkCmdBuildAccelerationStructuresKHR(vk.cmd, 1, &bi, &pRange);
-    VK_CHECK(vkEndCommandBuffer(vk.cmd));
-    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &vk.cmd;
-    VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(vk.queue));
-
-    VkAccelerationStructureDeviceAddressInfoKHR dai{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
-    dai.accelerationStructure = out.as;
+    const VkAccelerationStructureDeviceAddressInfoKHR dai{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+        .accelerationStructure = out.as,
+    };
     out.addr = vkGetAccelerationStructureDeviceAddressKHR(vk.device, &dai);
     return out;
 }
 
-static void buildBLAS() {
-    const VkBufferUsageFlags geoUsage =
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-    const VkMemoryPropertyFlags hostMem =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-
-    rt.posBuf = createBuffer(sizeof(kPrismPos), geoUsage, hostMem, true);
-    rt.idxBuf = createBuffer(sizeof(kPrismIdx), geoUsage, hostMem, true);
-    std::memcpy(rt.posBuf.mapped, kPrismPos, sizeof(kPrismPos));
-    std::memcpy(rt.idxBuf.mapped, kPrismIdx, sizeof(kPrismIdx));
-    rt.floorPosBuf = createBuffer(sizeof(kFloorPos), geoUsage, hostMem, true);
-    rt.floorIdxBuf = createBuffer(sizeof(kFloorIdx), geoUsage, hostMem, true);
-    std::memcpy(rt.floorPosBuf.mapped, kFloorPos, sizeof(kFloorPos));
-    std::memcpy(rt.floorIdxBuf.mapped, kFloorIdx, sizeof(kFloorIdx));
+void buildBlases() {
+    rt.prism = buildBlas(kPrismPos, kPrismIdx);
+    rt.floor = buildBlas(kFloorPos, kQuadIdx);
 
     // emissive source quad: world-space verts around the aperture centre,
     // e1 in the beam plane, e2 = world Z (identity TLAS instance)
-    V3 srcPos = beamSrcPos();
-    V3 L = beamD() * -1.0f;                 // toward the light
-    V3 e1 = norm(cross(L, V3{ 0, 0, 1 })) * kQuadHalf;
-    V3 e2 = V3{ 0, 0, 1 } * kQuadHalf;
-    V3 q0 = srcPos - e1 - e2, q1 = srcPos + e1 - e2;
-    V3 q2 = srcPos + e1 + e2, q3 = srcPos - e1 + e2;
-    const float quadPos[12] = { q0.x,q0.y,q0.z, q1.x,q1.y,q1.z,
-                                q2.x,q2.y,q2.z, q3.x,q3.y,q3.z };
-    static const uint32_t quadIdx[6] = { 0,1,2, 0,2,3 };
-    rt.quadPosBuf = createBuffer(sizeof(quadPos), geoUsage, hostMem, true);
-    rt.quadIdxBuf = createBuffer(sizeof(quadIdx), geoUsage, hostMem, true);
-    std::memcpy(rt.quadPosBuf.mapped, quadPos, sizeof(quadPos));
-    std::memcpy(rt.quadIdxBuf.mapped, quadIdx, sizeof(quadIdx));
-
-    BlasOut p = buildOneBLAS(rt.posBuf, 5, rt.idxBuf, kPrimCount,
-                             rt.prismBlasBuf, rt.prismScratch);
-    rt.prismBlas = p.as; rt.prismBlasAddr = p.addr;
-    BlasOut f = buildOneBLAS(rt.floorPosBuf, 3, rt.floorIdxBuf, 2,
-                             rt.floorBlasBuf, rt.floorScratch);
-    rt.floorBlas = f.as; rt.floorBlasAddr = f.addr;
-    BlasOut q = buildOneBLAS(rt.quadPosBuf, 3, rt.quadIdxBuf, 2,
-                             rt.quadBlasBuf, rt.quadScratch);
-    rt.quadBlas = q.as; rt.quadBlasAddr = q.addr;
+    const V3 src = beamSourcePos();
+    const V3 toLight = -beamDir();
+    const V3 e1 = normalize(cross(toLight, V3{ 0, 0, 1 })) * kQuadHalf;
+    const V3 e2 = V3{ 0, 0, 1 } * kQuadHalf;
+    const std::array<V3, 4> corners{ src - e1 - e2, src + e1 - e2, src + e1 + e2, src - e1 + e2 };
+    std::array<float, 12> quadPos;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        quadPos[i * 3 + 0] = corners[i].x;
+        quadPos[i * 3 + 1] = corners[i].y;
+        quadPos[i * 3 + 2] = corners[i].z;
+    }
+    rt.source = buildBlas(quadPos, kQuadIdx);
 }
 
-static void createTLAS() {
-    rt.instBuf = createBuffer(3 * sizeof(VkAccelerationStructureInstanceKHR),
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+void createTlas() {
+    constexpr uint32_t instanceCount = 3;
+    rt.instBuf = createBuffer(instanceCount * sizeof(VkAccelerationStructureInstanceKHR),
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, kHostMem, true);
 
-    rt.tlasGeom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
-    rt.tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    auto& inst = rt.tlasGeom.geometry.instances;
-    inst.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-    inst.arrayOfPointers = VK_FALSE;
-    inst.data.deviceAddress = rt.instBuf.addr;
+    rt.tlasGeom = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+        .geometry = { .instances = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+            .arrayOfPointers = VK_FALSE,
+            .data = { .deviceAddress = rt.instBuf.addr },
+        } },
+    };
+    rt.tlasBuild = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .geometryCount = 1,
+        .pGeometries = &rt.tlasGeom,
+    };
+    VkAccelerationStructureBuildSizesInfoKHR sizes{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+    uint32_t prims = instanceCount;
+    vkGetAccelerationStructureBuildSizesKHR(vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                            &rt.tlasBuild, &prims, &sizes);
 
-    rt.tlasBuild = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
-    rt.tlasBuild.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    rt.tlasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    rt.tlasBuild.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    rt.tlasBuild.geometryCount = 1;
-    rt.tlasBuild.pGeometries = &rt.tlasGeom;
+    rt.tlasBuf = createBuffer(sizes.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, kDeviceMem, true);
+    rt.tlasScratch = createBuffer(sizes.buildScratchSize + 256,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kDeviceMem, true);
 
-    VkAccelerationStructureBuildSizesInfoKHR sz{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-    uint32_t prims = 3;
-    vkGetAccelerationStructureBuildSizesKHR(vk.device,
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &rt.tlasBuild, &prims, &sz);
-
-    rt.tlasBuf = createBuffer(sz.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
-    rt.tlasScratch = createBuffer(sz.buildScratchSize + 256,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
-
-    VkAccelerationStructureCreateInfoKHR aci{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
-    aci.buffer = rt.tlasBuf.buf;
-    aci.size = sz.accelerationStructureSize;
-    aci.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    const VkAccelerationStructureCreateInfoKHR aci{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+        .buffer = rt.tlasBuf.buf,
+        .size = sizes.accelerationStructureSize,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+    };
     VK_CHECK(vkCreateAccelerationStructureKHR(vk.device, &aci, nullptr, &rt.tlas));
-
     rt.tlasBuild.dstAccelerationStructure = rt.tlas;
     rt.tlasBuild.scratchData.deviceAddress = alignUp(rt.tlasScratch.addr, 256);
 }
 
-// TLAS instances: [0] prism with Ry(yaw)*Rz(tilt), [1] static floor at the
-// prism base. customIndex selects the material in the closest-hit shader.
-static void writeInstanceTransform() {
-    float cy = (float)std::cos(g.prismYawY), sy = (float)std::sin(g.prismYawY);
-    float cz = (float)std::cos(g.prismTiltZ), sz = (float)std::sin(g.prismTiltZ);
-    float R[3][4] = {
-        {  cy * cz, -cy * sz,  sy, 0.0f },
-        {  sz,       cz,       0.0f, 0.0f },
-        { -sy * cz,  sy * sz,  cy, 0.0f },
+VkAccelerationStructureInstanceKHR makeInstance(const float (&rows)[3][4], uint32_t customIndex,
+                                                VkDeviceAddress blas) {
+    VkAccelerationStructureInstanceKHR inst{
+        .instanceCustomIndex = customIndex,
+        .mask = 0xFF,
+        .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
+        .accelerationStructureReference = blas,
     };
-    VkAccelerationStructureInstanceKHR inst[3]{};
-    std::memcpy(&inst[0].transform, R, sizeof(R));
-    inst[0].instanceCustomIndex = 0;
-    inst[0].mask = 0xFF;
-    inst[0].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst[0].accelerationStructureReference = rt.prismBlasAddr;
-
-    float F[3][4] = {
-        { 1, 0, 0, 0.0f },
-        { 0, 1, 0, -0.281f },      // just below the prism base (y = -0.28)
-        { 0, 0, 1, 0.0f },
-    };
-    std::memcpy(&inst[1].transform, F, sizeof(F));
-    inst[1].instanceCustomIndex = 1;
-    inst[1].mask = 0xFF;
-    inst[1].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst[1].accelerationStructureReference = rt.floorBlasAddr;
-
-    float Q[3][4] = {                       // identity: quad verts are world-space
-        { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 },
-    };
-    std::memcpy(&inst[2].transform, Q, sizeof(Q));
-    inst[2].instanceCustomIndex = 2;
-    inst[2].mask = 0xFF;
-    inst[2].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst[2].accelerationStructureReference = rt.quadBlasAddr;
-
-    std::memcpy(rt.instBuf.mapped, inst, sizeof(inst));
+    std::memcpy(&inst.transform, rows, sizeof(inst.transform));
+    return inst;
 }
 
-static void createPipelines() {
-    // ---- RT descriptor set layout (matches common.glsl bindings) ----
-    VkDescriptorSetLayoutBinding rtBind[7]{};
-    rtBind[0] = { 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
-                  VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
-    rtBind[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
-                  VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
-    rtBind[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                  VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr };
-    rtBind[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                  VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr };
-    rtBind[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-                  VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                  VK_SHADER_STAGE_MISS_BIT_KHR, nullptr };
-    rtBind[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                  VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };   // photon fog grid
-    rtBind[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                  VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };   // floor caustic map
-    VkDescriptorSetLayoutCreateInfo dli{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dli.bindingCount = 7;
-    dli.pBindings = rtBind;
+// TLAS instances: the prism with Ry(yaw)*Rz(tilt), the static floor at the
+// prism base, the source quad in world space. customIndex is what the
+// closest-hit reports (INST_* in layout.h).
+void writeInstances() {
+    const auto cy = static_cast<float>(std::cos(g.prismYawY));
+    const auto sy = static_cast<float>(std::sin(g.prismYawY));
+    const auto cz = static_cast<float>(std::cos(g.prismTiltZ));
+    const auto sz = static_cast<float>(std::sin(g.prismTiltZ));
+    const float prismXf[3][4] = {
+        {  cy * cz, -cy * sz,  sy,   0.0f },
+        {  sz,       cz,       0.0f, 0.0f },
+        { -sy * cz,  sy * sz,  cy,   0.0f },
+    };
+    const float floorXf[3][4] = {
+        { 1, 0, 0, 0.0f },
+        { 0, 1, 0, kFloorY },
+        { 0, 0, 1, 0.0f },
+    };
+    const float identityXf[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+
+    const std::array<VkAccelerationStructureInstanceKHR, 3> instances{
+        makeInstance(prismXf, INST_PRISM, rt.prism.addr),
+        makeInstance(floorXf, INST_FLOOR, rt.floor.addr),
+        makeInstance(identityXf, INST_SOURCE, rt.source.addr),
+    };
+    std::memcpy(rt.instBuf.mapped, instances.data(), sizeof(instances));
+}
+
+// One SBT: a base-aligned record per group (raygen, miss, hit).
+RT::SbtRegions createSbt(VkPipeline pipeline, Buffer& buffer) {
+    constexpr uint32_t groupCount = 3;
+    const uint32_t handleSize = vk.rtProps.shaderGroupHandleSize;
+    const VkDeviceSize baseAlign = vk.rtProps.shaderGroupBaseAlignment;
+    const VkDeviceSize record = alignUp(handleSize, baseAlign);
+
+    std::vector<uint8_t> handles(groupCount * handleSize);
+    VK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(vk.device, pipeline, 0, groupCount,
+                                                  handles.size(), handles.data()));
+    // the buffer's own address need not be base-aligned: pad and align inside
+    buffer = createBuffer(record * groupCount + baseAlign,
+        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, kHostMem, true);
+    const VkDeviceAddress base = alignUp(buffer.addr, baseAlign);
+    uint8_t* dst = static_cast<uint8_t*>(buffer.mapped) + (base - buffer.addr);
+    std::memset(dst, 0, static_cast<size_t>(record * groupCount));
+    for (uint32_t i = 0; i < groupCount; ++i)
+        std::memcpy(dst + i * record, handles.data() + i * handleSize, handleSize);
+
+    return {
+        .rgen = { base, record, record },
+        .miss = { base + record, record, record },
+        .hit = { base + record * 2, record, record },
+        .call = {},
+    };
+}
+
+void createPipelines() {
+    // ---- RT descriptor set layout (bindings from layout.h) ----
+    constexpr VkShaderStageFlags rgen = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    constexpr VkShaderStageFlags chit = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    constexpr VkShaderStageFlags all = rgen | chit | VK_SHADER_STAGE_MISS_BIT_KHR;
+    const std::array<VkDescriptorSetLayoutBinding, 7> rtBindings{ {
+        { BIND_TLAS,      VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rgen, nullptr },
+        { BIND_ACCUM,     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rgen, nullptr },
+        { BIND_POSITIONS, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, chit, nullptr },
+        { BIND_INDICES,   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, chit, nullptr },
+        { BIND_SCENE,     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, all, nullptr },
+        { BIND_FOG_GRID,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rgen, nullptr },
+        { BIND_CAUSTIC,   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rgen, nullptr },
+    } };
+    VkDescriptorSetLayoutCreateInfo dli{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<uint32_t>(rtBindings.size()),
+        .pBindings = rtBindings.data(),
+    };
     VK_CHECK(vkCreateDescriptorSetLayout(vk.device, &dli, nullptr, &rt.rtSetLayout));
 
     // ---- resolve descriptor set layout ----
-    VkDescriptorSetLayoutBinding resBind[2]{};
-    resBind[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-    resBind[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-    dli.bindingCount = 2;
-    dli.pBindings = resBind;
+    const std::array<VkDescriptorSetLayoutBinding, 2> resBindings{ {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+    } };
+    dli.bindingCount = static_cast<uint32_t>(resBindings.size());
+    dli.pBindings = resBindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(vk.device, &dli, nullptr, &rt.resSetLayout));
 
     // ---- descriptor pool + sets ----
-    VkDescriptorPoolSize sizes[] = {
+    const std::array<VkDescriptorPoolSize, 4> poolSizes{ {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+    } };
+    const VkDescriptorPoolCreateInfo dpi{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 2,
+        .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+        .pPoolSizes = poolSizes.data(),
     };
-    VkDescriptorPoolCreateInfo dpi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpi.maxSets = 2;
-    dpi.poolSizeCount = 4;
-    dpi.pPoolSizes = sizes;
     VK_CHECK(vkCreateDescriptorPool(vk.device, &dpi, nullptr, &rt.descPool));
 
-    VkDescriptorSetAllocateInfo dsa{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dsa.descriptorPool = rt.descPool;
-    dsa.descriptorSetCount = 1;
-    dsa.pSetLayouts = &rt.rtSetLayout;
+    VkDescriptorSetAllocateInfo dsa{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = rt.descPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &rt.rtSetLayout,
+    };
     VK_CHECK(vkAllocateDescriptorSets(vk.device, &dsa, &rt.rtSet));
     dsa.pSetLayouts = &rt.resSetLayout;
     VK_CHECK(vkAllocateDescriptorSets(vk.device, &dsa, &rt.resSet));
 
     // ---- pipeline layouts ----
-    VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    pli.setLayoutCount = 1;
-    pli.pSetLayouts = &rt.rtSetLayout;
+    VkPipelineLayoutCreateInfo pli{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &rt.rtSetLayout,
+    };
     VK_CHECK(vkCreatePipelineLayout(vk.device, &pli, nullptr, &rt.rtLayout));
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 };  // ResolvePC
+    const VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 };  // ResolvePC
     pli.pSetLayouts = &rt.resSetLayout;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pcr;
     VK_CHECK(vkCreatePipelineLayout(vk.device, &pli, nullptr, &rt.resLayout));
 
-    // ---- RT pipeline (rgen / miss / chit) + SBT ----
-    VkShaderModule mRgen = loadShader("prism.rgen.spv");
-    VkShaderModule mMiss = loadShader("prism.rmiss.spv");
-    VkShaderModule mChit = loadShader("prism.rchit.spv");
+    // ---- the two RT pipelines: own raygen each, shared thin miss / chit ----
+    const VkShaderModule mCamera = loadShader("prism.rgen.spv");
+    const VkShaderModule mPhoton = loadShader("photon.rgen.spv");
+    const VkShaderModule mMiss = loadShader("prism.rmiss.spv");
+    const VkShaderModule mChit = loadShader("prism.rchit.spv");
 
-    VkPipelineShaderStageCreateInfo stages[3]{};
-    for (auto& s : stages) s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;      stages[0].module = mRgen; stages[0].pName = "main";
-    stages[1].stage = VK_SHADER_STAGE_MISS_BIT_KHR;        stages[1].module = mMiss; stages[1].pName = "main";
-    stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR; stages[2].module = mChit; stages[2].pName = "main";
-
-    VkRayTracingShaderGroupCreateInfoKHR groups[3]{};
-    for (auto& gr : groups) {
-        gr.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-        gr.generalShader = VK_SHADER_UNUSED_KHR;
-        gr.closestHitShader = VK_SHADER_UNUSED_KHR;
-        gr.anyHitShader = VK_SHADER_UNUSED_KHR;
-        gr.intersectionShader = VK_SHADER_UNUSED_KHR;
-    }
-    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[0].generalShader = 0;
-    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[1].generalShader = 1;
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[2].closestHitShader = 2;
-
+    std::array<VkPipelineShaderStageCreateInfo, 3> stages{ {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR, .module = mCamera, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_MISS_BIT_KHR, .module = mMiss, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, .module = mChit, .pName = "main" },
+    } };
+    constexpr auto general = [](uint32_t shader) {
+        return VkRayTracingShaderGroupCreateInfoKHR{
+            .sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
+            .type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,
+            .generalShader = shader,
+            .closestHitShader = VK_SHADER_UNUSED_KHR,
+            .anyHitShader = VK_SHADER_UNUSED_KHR,
+            .intersectionShader = VK_SHADER_UNUSED_KHR,
+        };
+    };
+    const std::array<VkRayTracingShaderGroupCreateInfoKHR, 3> groups{ {
+        general(0),
+        general(1),
+        { .sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
+          .type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
+          .generalShader = VK_SHADER_UNUSED_KHR,
+          .closestHitShader = 2,
+          .anyHitShader = VK_SHADER_UNUSED_KHR,
+          .intersectionShader = VK_SHADER_UNUSED_KHR },
+    } };
     VkRayTracingPipelineCreateInfoKHR rpi{
-        VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
-    rpi.stageCount = 3;
-    rpi.pStages = stages;
-    rpi.groupCount = 3;
-    rpi.pGroups = groups;
-    rpi.maxPipelineRayRecursionDepth = 1;   // bounce loops live in rgen
-    rpi.layout = rt.rtLayout;
+        .sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
+        .stageCount = static_cast<uint32_t>(stages.size()),
+        .pStages = stages.data(),
+        .groupCount = static_cast<uint32_t>(groups.size()),
+        .pGroups = groups.data(),
+        .maxPipelineRayRecursionDepth = 1,   // bounce loops live in rgen
+        .layout = rt.rtLayout,
+    };
     VK_CHECK(vkCreateRayTracingPipelinesKHR(vk.device, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                            1, &rpi, nullptr, &rt.rtPipe));
-
-    // photon pipeline: photon.rgen + the same thin miss/chit modules
-    VkShaderModule mPhot = loadShader("photon.rgen.spv");
-    stages[0].module = mPhot;
+                                            1, &rpi, nullptr, &rt.cameraPipe));
+    stages[0].module = mPhoton;
     VK_CHECK(vkCreateRayTracingPipelinesKHR(vk.device, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                             1, &rpi, nullptr, &rt.photonPipe));
-    vkDestroyShaderModule(vk.device, mPhot, nullptr);
-    vkDestroyShaderModule(vk.device, mRgen, nullptr);
-    vkDestroyShaderModule(vk.device, mMiss, nullptr);
-    vkDestroyShaderModule(vk.device, mChit, nullptr);
+    for (VkShaderModule m : { mCamera, mPhoton, mMiss, mChit })
+        vkDestroyShaderModule(vk.device, m, nullptr);
 
-    // SBT: one aligned record per group
-    const uint32_t handleSize = vk.rtProps.shaderGroupHandleSize;
-    const uint32_t baseAlign  = vk.rtProps.shaderGroupBaseAlignment;
-    const VkDeviceSize record = alignUp(handleSize, baseAlign);
-    std::vector<uint8_t> handles(3 * handleSize);
-    VK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(vk.device, rt.rtPipe, 0, 3,
-                                                  handles.size(), handles.data()));
-    rt.sbtBuf = createBuffer(record * 3,
-        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
-    uint8_t* dst = (uint8_t*)rt.sbtBuf.mapped;
-    std::memset(dst, 0, (size_t)(record * 3));
-    for (int i = 0; i < 3; ++i)
-        std::memcpy(dst + i * record, handles.data() + i * handleSize, handleSize);
-    rt.sbtRgen = { rt.sbtBuf.addr,              record, record };
-    rt.sbtMiss = { rt.sbtBuf.addr + record,     record, record };
-    rt.sbtHit  = { rt.sbtBuf.addr + record * 2, record, record };
-    rt.sbtCall = { 0, 0, 0 };
-
-    // photon SBT (separate pipeline -> separate handles)
-    std::vector<uint8_t> phHandles(3 * handleSize);
-    VK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(vk.device, rt.photonPipe, 0, 3,
-                                                  phHandles.size(), phHandles.data()));
-    rt.photonSbtBuf = createBuffer(record * 3,
-        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
-    uint8_t* pdst = (uint8_t*)rt.photonSbtBuf.mapped;
-    std::memset(pdst, 0, (size_t)(record * 3));
-    for (int i = 0; i < 3; ++i)
-        std::memcpy(pdst + i * record, phHandles.data() + i * handleSize, handleSize);
-    rt.phRgen = { rt.photonSbtBuf.addr,              record, record };
-    rt.phMiss = { rt.photonSbtBuf.addr + record,     record, record };
-    rt.phHit  = { rt.photonSbtBuf.addr + record * 2, record, record };
-    rt.phCall = { 0, 0, 0 };
+    rt.cameraRegions = createSbt(rt.cameraPipe, rt.cameraSbt);
+    rt.photonRegions = createSbt(rt.photonPipe, rt.photonSbt);
 
     // ---- resolve compute pipeline ----
-    VkShaderModule mRes = loadShader("resolve.comp.spv");
-    VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = mRes;
-    cpi.stage.pName = "main";
-    cpi.layout = rt.resLayout;
+    const VkShaderModule mRes = loadShader("resolve.comp.spv");
+    const VkComputePipelineCreateInfo cpi{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mRes, .pName = "main" },
+        .layout = rt.resLayout,
+    };
     VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &cpi, nullptr, &rt.resPipe));
     vkDestroyShaderModule(vk.device, mRes, nullptr);
 
-    // ---- UBO ----
-    rt.uboBuf = createBuffer(sizeof(SceneUBO),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
-
-    // ---- photon storage: fog grid + floor caustic (device local) ----
-    rt.gridBuf = createBuffer(kGridBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
-    rt.causBuf = createBuffer(kCausBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    // ---- UBO + photon storage (fog grid, floor caustic; device local) ----
+    rt.uboBuf = createBuffer(sizeof(SceneUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHostMem, false);
+    constexpr VkBufferUsageFlags photonUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    rt.gridBuf = createBuffer(kGridBytes, photonUsage, kDeviceMem, false);
+    rt.causBuf = createBuffer(kCausBytes, photonUsage, kDeviceMem, false);
 }
 
 // (re)create render targets and point the descriptor sets at them
-static void createTargets() {
+void createTargets() {
     destroyImage(rt.accum);
     destroyImage(rt.outImg);
     rt.accum = createStorageImage(VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -1059,217 +1164,199 @@ static void createTargets() {
         vk.extent.width, vk.extent.height,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
-    // transition both to GENERAL once
-    VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(vk.cmd, &cbi));
-    barrierImage(vk.cmd, rt.accum.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                 0, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    barrierImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                 0, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    VK_CHECK(vkEndCommandBuffer(vk.cmd));
-    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &vk.cmd;
-    VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(vk.queue));
+    // both live in GENERAL layout from now on
+    submitAndWait([&](VkCommandBuffer cmd) {
+        for (VkImage img : { rt.accum.img, rt.outImg.img })
+            barrierImage(cmd, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, 0,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    });
 
-    // descriptor writes
-    VkWriteDescriptorSetAccelerationStructureKHR asw{
-        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-    asw.accelerationStructureCount = 1;
-    asw.pAccelerationStructures = &rt.tlas;
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, rt.accum.view, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, rt.outImg.view, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo posInfo{ rt.posBuf.buf, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo idxInfo{ rt.idxBuf.buf, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo uboInfo{ rt.uboBuf.buf, 0, sizeof(SceneUBO) };
-    VkDescriptorBufferInfo gridInfo{ rt.gridBuf.buf, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo causInfo{ rt.causBuf.buf, 0, VK_WHOLE_SIZE };
+    const VkWriteDescriptorSetAccelerationStructureKHR asWrite{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+        .accelerationStructureCount = 1,
+        .pAccelerationStructures = &rt.tlas,
+    };
+    const VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, rt.accum.view, VK_IMAGE_LAYOUT_GENERAL };
+    const VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, rt.outImg.view, VK_IMAGE_LAYOUT_GENERAL };
+    const VkDescriptorBufferInfo posInfo{ rt.prism.positions.buf, 0, VK_WHOLE_SIZE };
+    const VkDescriptorBufferInfo idxInfo{ rt.prism.indices.buf, 0, VK_WHOLE_SIZE };
+    const VkDescriptorBufferInfo uboInfo{ rt.uboBuf.buf, 0, sizeof(SceneUBO) };
+    const VkDescriptorBufferInfo gridInfo{ rt.gridBuf.buf, 0, VK_WHOLE_SIZE };
+    const VkDescriptorBufferInfo causInfo{ rt.causBuf.buf, 0, VK_WHOLE_SIZE };
 
-    VkWriteDescriptorSet w[9]{};
-    for (auto& x : w) x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = rt.rtSet; w[0].dstBinding = 0; w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; w[0].pNext = &asw;
-    w[1].dstSet = rt.rtSet; w[1].dstBinding = 1; w[1].descriptorCount = 1;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &accumInfo;
-    w[2].dstSet = rt.rtSet; w[2].dstBinding = 2; w[2].descriptorCount = 1;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &posInfo;
-    w[3].dstSet = rt.rtSet; w[3].dstBinding = 3; w[3].descriptorCount = 1;
-    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &idxInfo;
-    w[4].dstSet = rt.rtSet; w[4].dstBinding = 4; w[4].descriptorCount = 1;
-    w[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[4].pBufferInfo = &uboInfo;
-    w[5].dstSet = rt.rtSet; w[5].dstBinding = 5; w[5].descriptorCount = 1;
-    w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[5].pBufferInfo = &gridInfo;
-    w[6].dstSet = rt.rtSet; w[6].dstBinding = 6; w[6].descriptorCount = 1;
-    w[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[6].pBufferInfo = &causInfo;
-    w[7].dstSet = rt.resSet; w[7].dstBinding = 0; w[7].descriptorCount = 1;
-    w[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[7].pImageInfo = &accumInfo;
-    w[8].dstSet = rt.resSet; w[8].dstBinding = 1; w[8].descriptorCount = 1;
-    w[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[8].pImageInfo = &outInfo;
-    vkUpdateDescriptorSets(vk.device, 9, w, 0, nullptr);
+    const auto write = [](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                          const VkDescriptorImageInfo* image, const VkDescriptorBufferInfo* buffer,
+                          const void* next = nullptr) {
+        return VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = next,
+            .dstSet = set,
+            .dstBinding = binding,
+            .descriptorCount = 1,
+            .descriptorType = type,
+            .pImageInfo = image,
+            .pBufferInfo = buffer,
+        };
+    };
+    const std::array<VkWriteDescriptorSet, 9> writes{ {
+        write(rt.rtSet, BIND_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, &asWrite),
+        write(rt.rtSet, BIND_ACCUM, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr),
+        write(rt.rtSet, BIND_POSITIONS, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &posInfo),
+        write(rt.rtSet, BIND_INDICES, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &idxInfo),
+        write(rt.rtSet, BIND_SCENE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo),
+        write(rt.rtSet, BIND_FOG_GRID, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &gridInfo),
+        write(rt.rtSet, BIND_CAUSTIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &causInfo),
+        write(rt.resSet, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr),
+        write(rt.resSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr),
+    } };
+    vkUpdateDescriptorSets(vk.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 // =========================== frame loop =================================
-static void updateUBO(uint32_t frameIndex) {
+
+void updateUbo(uint32_t frameIndex) {
     // orbit camera around the prism
-    V3 target{ 0.0f, 0.10f, 0.0f };
-    float cy = (float)std::cos(g.yaw), sy = (float)std::sin(g.yaw);
-    float cp = (float)std::cos(g.pitch), sp = (float)std::sin(g.pitch);
-    V3 eye = target + V3{ sy * cp, sp, cy * cp } * (float)g.dist;
-    M4 V = lookAt(eye, target, { 0, 1, 0 });
-    M4 P = perspective(40.0f, (float)vk.extent.width / (float)vk.extent.height,
-                       0.05f, 100.0f);
-    M4 inv = inverse(mul(P, V));
+    const V3 target{ 0.0f, 0.10f, 0.0f };
+    const float cy = static_cast<float>(std::cos(g.yaw)), sy = static_cast<float>(std::sin(g.yaw));
+    const float cp = static_cast<float>(std::cos(g.pitch)), sp = static_cast<float>(std::sin(g.pitch));
+    const V3 eye = target + V3{ sy * cp, sp, cy * cp } * static_cast<float>(g.dist);
+    const float aspect = static_cast<float>(vk.extent.width) / static_cast<float>(vk.extent.height);
+    const M4 invViewProj = mul(inverseLookAt(eye, target, { 0, 1, 0 }),
+                               inversePerspective(40.0f, aspect, 0.05f, 100.0f));
 
-    V3 D = beamD();
-    V3 srcPos = beamSrcPos();
-
-    SceneUBO u{};
-    std::memcpy(u.invViewProj, inv.m, sizeof(inv.m));
-    u.camPos[0] = eye.x; u.camPos[1] = eye.y; u.camPos[2] = eye.z; u.camPos[3] = 0;
-    u.lightDir[0] = -D.x; u.lightDir[1] = -D.y; u.lightDir[2] = -D.z;
-    u.lightDir[3] = std::cos(0.35f * (float)M_PI / 180.0f);
-    u.srcPosRadius[0] = srcPos.x; u.srcPosRadius[1] = srcPos.y;
-    u.srcPosRadius[2] = srcPos.z; u.srcPosRadius[3] = kBeamRadius;
-    u.dimsFrameSpp[0] = vk.extent.width;
-    u.dimsFrameSpp[1] = vk.extent.height;
-    u.dimsFrameSpp[2] = frameIndex;
-    u.dimsFrameSpp[3] = 1;                                  // spp per frame
-    u.misc[0] = g.sf10 ? 1u : 0u;
-    u.misc[1] = 10u;                                        // maxDepth
-    u.misc[2] = bits(420.0f);                                // beam intensity
-    u.misc[3] = bits(kFog[g.fogIdx]);                       // fog sigma
+    const V3 toLight = -beamDir();
+    const V3 src = beamSourcePos();
+    SceneUBO u{
+        .camPos = { eye.x, eye.y, eye.z, 0.0f },
+        .lightDir = { toLight.x, toLight.y, toLight.z, std::cos(degToRad(kSourceHalfAngleDeg)) },
+        .srcPosRadius = { src.x, src.y, src.z, kBeamRadius },
+        .dimsFrameSpp = { vk.extent.width, vk.extent.height, frameIndex, 1 },
+        .misc = { g.sf10 ? 1u : 0u, kMaxDepth, std::bit_cast<uint32_t>(kBeamIntensity),
+                  std::bit_cast<uint32_t>(kFog[static_cast<size_t>(g.fogIdx)]) },
+    };
+    std::ranges::copy(invViewProj.m, u.invViewProj);
     std::memcpy(rt.uboBuf.mapped, &u, sizeof(u));
 }
 
-static void recordFrame(uint32_t swapIdx, uint32_t frameIndex) {
+void recordFrame(uint32_t swapIdx, uint32_t frameIndex) {
     VK_CHECK(vkResetCommandBuffer(vk.cmd, 0));
-    VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    const VkCommandBufferBeginInfo cbi{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
     VK_CHECK(vkBeginCommandBuffer(vk.cmd, &cbi));
+    constexpr VkPipelineStageFlags rtStage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 
     // 1) rebuild the TLAS with the current prism transform (3 instances)
-    VkAccelerationStructureBuildRangeInfoKHR range{};
-    range.primitiveCount = 3;
+    const VkAccelerationStructureBuildRangeInfoKHR range{ .primitiveCount = 3 };
     const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
     vkCmdBuildAccelerationStructuresKHR(vk.cmd, 1, &rt.tlasBuild, &pRange);
-    VkMemoryBarrier asb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    asb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(vk.cmd,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        0, 1, &asb, 0, nullptr, 0, nullptr);
+    barrierMemory(vk.cmd, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                  VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                  VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, rtStage);
 
     // 2) photon pass: forward beam transport into the fog grid + caustic map.
     // On accumulation reset, zero both first.
     if (frameIndex == 0) {
         vkCmdFillBuffer(vk.cmd, rt.gridBuf.buf, 0, VK_WHOLE_SIZE, 0);
         vkCmdFillBuffer(vk.cmd, rt.causBuf.buf, 0, VK_WHOLE_SIZE, 0);
-        VkMemoryBarrier fb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        fb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(vk.cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-            0, 1, &fb, 0, nullptr, 0, nullptr);
+        barrierMemory(vk.cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, rtStage);
     }
     vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt.photonPipe);
     vkCmdBindDescriptorSets(vk.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             rt.rtLayout, 0, 1, &rt.rtSet, 0, nullptr);
-    vkCmdTraceRaysKHR(vk.cmd, &rt.phRgen, &rt.phMiss, &rt.phHit, &rt.phCall,
-                      60, 12, 1);                       // PH_APERTURE x PH_LAMBDA
-
-    VkMemoryBarrier pb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    pb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    pb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(vk.cmd,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        0, 1, &pb, 0, nullptr, 0, nullptr);
+    const RT::SbtRegions& ph = rt.photonRegions;
+    vkCmdTraceRaysKHR(vk.cmd, &ph.rgen, &ph.miss, &ph.hit, &ph.call, PHOTON_APERTURE, PHOTON_LAMBDA, 1);
+    barrierMemory(vk.cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, rtStage, rtStage);
 
     // 3) camera pass: accumulate spectral XYZ
-    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt.rtPipe);
+    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt.cameraPipe);
     vkCmdBindDescriptorSets(vk.cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             rt.rtLayout, 0, 1, &rt.rtSet, 0, nullptr);
-    vkCmdTraceRaysKHR(vk.cmd, &rt.sbtRgen, &rt.sbtMiss, &rt.sbtHit, &rt.sbtCall,
+    const RT::SbtRegions& cam = rt.cameraRegions;
+    vkCmdTraceRaysKHR(vk.cmd, &cam.rgen, &cam.miss, &cam.hit, &cam.call,
                       vk.extent.width, vk.extent.height, 1);
-
-    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(vk.cmd,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, nullptr, 0, nullptr);
+    barrierMemory(vk.cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                  rtStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     // 4) resolve: average, tonemap, gamma -> outImg
-    struct { uint32_t frameCount; float exposure; } pc{ frameIndex + 1, g.exposure };
+    const struct { uint32_t frameCount; float exposure; } pc{ frameIndex + 1, g.exposure };
     vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rt.resPipe);
     vkCmdBindDescriptorSets(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             rt.resLayout, 0, 1, &rt.resSet, 0, nullptr);
-    vkCmdPushConstants(vk.cmd, rt.resLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &pc);
+    vkCmdPushConstants(vk.cmd, rt.resLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(vk.cmd, (vk.extent.width + 7) / 8, (vk.extent.height + 7) / 8, 1);
 
-    // 4) blit outImg -> swapchain image
-    barrierImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_GENERAL,
-                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    // 5) blit outImg -> swapchain image
+    barrierImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                  VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    barrierImage(vk.cmd, vk.swapImages[swapIdx], VK_IMAGE_LAYOUT_UNDEFINED,
-                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    barrierImage(vk.cmd, vk.swapImages[swapIdx],
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                  0, VK_ACCESS_TRANSFER_WRITE_BIT,
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    VkImageBlit blit{};
-    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    blit.srcOffsets[1] = { (int32_t)vk.extent.width, (int32_t)vk.extent.height, 1 };
-    blit.dstOffsets[1] = { (int32_t)vk.extent.width, (int32_t)vk.extent.height, 1 };
+    const VkOffset3D size{ static_cast<int32_t>(vk.extent.width), static_cast<int32_t>(vk.extent.height), 1 };
+    const VkImageBlit blit{
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { {}, size },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { {}, size },
+    };
     vkCmdBlitImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   vk.swapImages[swapIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &blit, VK_FILTER_NEAREST);
+                   vk.swapImages[swapIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 
-    barrierImage(vk.cmd, vk.swapImages[swapIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    barrierImage(vk.cmd, vk.swapImages[swapIdx],
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                  VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    barrierImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 VK_IMAGE_LAYOUT_GENERAL,
+    barrierImage(vk.cmd, rt.outImg.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                  VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     VK_CHECK(vkEndCommandBuffer(vk.cmd));
 }
 
+} // namespace
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
-    WNDCLASSW wc = {};
-    wc.style = CS_OWNDC;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"PrismRTWnd";
+    enableDpiAwareness();
+
+    const WNDCLASSW wc{
+        .lpfnWndProc = WndProc,
+        .hInstance = hInst,
+        .hCursor = LoadCursor(nullptr, IDC_ARROW),
+        .lpszClassName = L"PrismRTWnd",
+    };
     RegisterClassW(&wc);
 
-    RECT r = { 0, 0, g.winW, g.winH };
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    // the default 1280x720 is in 96-dpi units; scale it so the window opens
+    // at the same apparent size on a HiDPI display (and renders every pixel)
+    const UINT dpi = systemDpi();
+    g.winW = MulDiv(g.winW, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+    g.winH = MulDiv(g.winH, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+    const RECT r = windowRectFor(g.winW, g.winH, dpi);
     HWND hWnd = CreateWindowW(L"PrismRTWnd", L"PrismRT", WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT,
-                              r.right - r.left, r.bottom - r.top,
+                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                               nullptr, nullptr, hInst, nullptr);
     if (!hWnd) return 1;
 
     initVulkan(hWnd, hInst);
     createSwapchain();
-    buildBLAS();
-    createTLAS();
+    buildBlases();
+    createTlas();
     createPipelines();
     createTargets();
     ShowWindow(hWnd, nCmdShow);
 
     uint32_t frameIndex = 0;
     ULONGLONG lastTitle = 0;
+    LARGE_INTEGER clockFreq, lastTick;
+    QueryPerformanceFrequency(&clockFreq);
+    QueryPerformanceCounter(&lastTick);
+    double frameMs = 0.0;
 
     while (!g.quit) {
         MSG msg;
@@ -1292,55 +1379,66 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (g.reset) { frameIndex = 0; g.reset = false; }
 
-        writeInstanceTransform();
-        updateUBO(frameIndex);
+        writeInstances();
+        updateUbo(frameIndex);
 
         uint32_t swapIdx = 0;
-        VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX,
-                                             vk.semAcquire, VK_NULL_HANDLE, &swapIdx);
-        if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
+        const VkResult acquired = vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX,
+                                                        vk.semAcquire, VK_NULL_HANDLE, &swapIdx);
+        if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {   // nothing acquired, semaphore untouched
             g.sizeDirty = true;
             continue;
         }
-        VK_CHECK(acq);
+        // VK_SUBOPTIMAL_KHR did acquire an image (and will signal the semaphore):
+        // render this frame on it and rebuild the swapchain afterwards.
+        if (acquired == VK_SUBOPTIMAL_KHR) g.sizeDirty = true;
+        else VK_CHECK(acquired);
         VK_CHECK(vkResetFences(vk.device, 1, &vk.fence));
 
         recordFrame(swapIdx, frameIndex);
 
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &vk.semAcquire;
-        si.pWaitDstStageMask = &waitStage;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &vk.cmd;
-        si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &vk.semRender;
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        const VkSubmitInfo si{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &vk.semAcquire,
+            .pWaitDstStageMask = &waitStage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &vk.cmd,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &vk.semRender,
+        };
         VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, vk.fence));
 
-        VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &vk.semRender;
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &vk.swapchain;
-        pi.pImageIndices = &swapIdx;
-        VkResult pres = vkQueuePresentKHR(vk.queue, &pi);
-        if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR)
-            g.sizeDirty = true;
-        else
-            VK_CHECK(pres);
+        const VkPresentInfoKHR pi{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &vk.semRender,
+            .swapchainCount = 1,
+            .pSwapchains = &vk.swapchain,
+            .pImageIndices = &swapIdx,
+        };
+        const VkResult presented = vkQueuePresentKHR(vk.queue, &pi);
+        if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) g.sizeDirty = true;
+        else VK_CHECK(presented);
 
         ++frameIndex;
 
-        ULONGLONG now = GetTickCount64();
-        if (now - lastTitle > 250) {
-            wchar_t t[200];
-            swprintf(t, 200,
-                L"PrismRT - %s   fog %.2f   %u frames   "
-                L"[LMB] orbit  [RMB] prism  [wheel] zoom  [G]lass  [F]og  [Esc]",
-                g.sf10 ? L"SF10" : L"BK7", (double)kFog[g.fogIdx], frameIndex);
-            SetWindowTextW(hWnd, t);
-            lastTitle = now;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const double ms = 1000.0 * static_cast<double>(now.QuadPart - lastTick.QuadPart)
+                         / static_cast<double>(clockFreq.QuadPart);
+        lastTick = now;
+        frameMs = frameMs == 0.0 ? ms : frameMs * 0.9 + ms * 0.1;
+
+        const ULONGLONG tick = GetTickCount64();
+        if (tick - lastTitle > 250) {
+            const std::wstring title = std::format(
+                L"PrismRT - {}   fog {:.2f}   {} frames   {:.1f} ms   "
+                L"[LMB] orbit  [RMB] prism  [wheel] zoom  [G]lass  [F]og  [+/-] exposure  [Esc]",
+                g.sf10 ? L"SF10" : L"BK7", kFog[static_cast<size_t>(g.fogIdx)], frameIndex, frameMs);
+            SetWindowTextW(hWnd, title.c_str());
+            lastTitle = tick;
         }
     }
 

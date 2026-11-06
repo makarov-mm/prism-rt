@@ -1,7 +1,9 @@
 // common.glsl — thin payload, scene UBO, photon-grid layout, shared scene
-// constants. MUST match PrismRT.cpp (std140 UBO, grid dimensions, scale).
+// constants. The numbers shared with the host come from layout.h; the UBO
+// layout (std140) mirrors SceneUBO in PrismRT.cpp.
 #ifndef COMMON_GLSL
 #define COMMON_GLSL
+#include "layout.h"
 
 // Thin payload: closest-hit only reports the hit. ALL material logic lives in
 // the raygen shaders — deterministic Whitted-style shading, no RNG in payload.
@@ -11,7 +13,7 @@ struct Payload {
     vec3  N;        // geometric normal, unoriented (valid for the prism)
 };
 
-layout(binding = 4, set = 0, std140) uniform SceneUBO {
+layout(binding = BIND_SCENE, set = 0, std140) uniform SceneUBO {
     mat4  invViewProj;
     vec4  camPos;
     vec4  lightDir;       // xyz toward light, w = cos(half-angle) of the source
@@ -32,15 +34,15 @@ layout(binding = 4, set = 0, std140) uniform SceneUBO {
 // 3D fog grid: XYZ energy density; 2D floor caustic map: XYZ irradiance.
 // The photon pass fills them; the camera pass reads them. Cleared on reset;
 // both accumulate over frames, normalized by (frameIndex + 1).
-const int   GX = 148, GY = 52, GZ = 40;
-const float GRID_H = 0.03;
-const vec3  GRID_MIN = vec3(-1.85, -0.35, -0.60);
-const int   CX = 384, CZ = 384;
-const float CAUS_MIN = -3.0, CAUS_MAX = 3.0;
-const float FP_SCALE = 32.0;          // fixed-point scale for atomic uints
+const int   GX = GRID_X, GY = GRID_Y, GZ = GRID_Z;
+const float GRID_H = GRID_CELL;
+const vec3  GRID_MIN = vec3(GRID_ORIGIN_X, GRID_ORIGIN_Y, GRID_ORIGIN_Z);
+const int   CX = CAUS_X, CZ = CAUS_Z;
+const float CAUS_MIN = CAUS_RANGE_MIN, CAUS_MAX = CAUS_RANGE_MAX;
+const float FP_SCALE = FIXED_POINT_SCALE;   // fixed-point scale for atomic uints
 
-layout(binding = 5, set = 0, std430) buffer FogGrid { uint fogGrid[]; };   // GX*GY*GZ*3
-layout(binding = 6, set = 0, std430) buffer CausMap { uint causMap[]; };   // CX*CZ*3
+layout(binding = BIND_FOG_GRID, set = 0, std430) buffer FogGrid { uint fogGrid[]; };   // GX*GY*GZ*3
+layout(binding = BIND_CAUSTIC,  set = 0, std430) buffer CausMap { uint causMap[]; };   // CX*CZ*3
 
 // ---- shared scene constants ----
 const vec3  SUN_DIR      = vec3(-0.4082483, 0.8164966, 0.4082483);
@@ -48,7 +50,7 @@ const float SUN_COS_IN   = 0.99925;
 const float SUN_COS_OUT  = 0.99890;
 const float SUN_RADIANCE = 60.0;
 const float SUN_E        = 2.4;
-const float FLOOR_Y      = -0.281;
+const float FLOOR_Y      = FLOOR_PLANE_Y;
 
 // XYZ integrals of the achromatic material spectra (precomputed)
 const vec3 XYZ_WHITE   = vec3(106.6534, 106.8575, 106.3342);

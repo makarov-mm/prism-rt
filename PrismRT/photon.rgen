@@ -18,11 +18,11 @@
 // accumulated across frames (jittered by golden-ratio sequences) and
 // normalized by frame count at sampling time.
 
-layout(binding = 0, set = 0) uniform accelerationStructureEXT tlas;
+layout(binding = BIND_TLAS, set = 0) uniform accelerationStructureEXT tlas;
 layout(location = 0) rayPayloadEXT Payload pay;
 
-const int PH_APERTURE = 60;
-const int PH_LAMBDA   = 12;
+const int PH_APERTURE = PHOTON_APERTURE;
+const int PH_LAMBDA   = PHOTON_LAMBDA;
 
 void traceThin(vec3 o, vec3 d) {
     pay.hitT = 1e30; pay.inst = 0xFFFFFFFFu;
@@ -94,8 +94,8 @@ void main() {
         vec3 endP = o + d * (hit ? pay.hitT : 8.0);
         if (!inGlass) gridDeposit(o, endP, power);
         if (!hit) break;
-        if (pay.inst == 2u) { o = endP + d * 1e-4; continue; }   // own quad
-        if (pay.inst == 1u) {                                     // floor
+        if (pay.inst == uint(INST_SOURCE)) { o = endP + d * 1e-4; continue; }  // own quad
+        if (pay.inst == uint(INST_FLOOR)) {
             if (!inGlass) causticDeposit(endP, power);
             break;
         }

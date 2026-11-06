@@ -11,21 +11,21 @@
 layout(location = 0) rayPayloadInEXT Payload pay;
 hitAttributeEXT vec2 attribs;
 
-layout(set = 0, binding = 2, scalar) readonly buffer Positions { vec3 pos[]; };
-layout(set = 0, binding = 3, scalar) readonly buffer Indices  { uint idx[]; };
+layout(set = 0, binding = BIND_POSITIONS, scalar) readonly buffer Positions { vec3 pos[]; };
+layout(set = 0, binding = BIND_INDICES,   scalar) readonly buffer Indices  { uint idx[]; };
 
 void main() {
     pay.hitT = gl_HitTEXT;
     pay.inst = gl_InstanceCustomIndexEXT;
-    if (pay.inst == 0u) {                    // prism: geometric normal
+    if (pay.inst == uint(INST_PRISM)) {      // prism: geometric normal
         uint base = 3u * uint(gl_PrimitiveID);
         vec3 p0 = pos[idx[base + 0u]];
         vec3 p1 = pos[idx[base + 1u]];
         vec3 p2 = pos[idx[base + 2u]];
         vec3 nObj = normalize(cross(p1 - p0, p2 - p0));
         pay.N = normalize(nObj * mat3(gl_WorldToObjectEXT));
-    } else if (pay.inst == 1u) {
-        pay.N = vec3(0.0, 1.0, 0.0);         // floor
+    } else if (pay.inst == uint(INST_FLOOR)) {
+        pay.N = vec3(0.0, 1.0, 0.0);
     } else {
         pay.N = normalize(ubo.lightDir.xyz); // source quad (unused by shading)
     }
